@@ -2,40 +2,45 @@
 
 [English](#english)
 
-这是一个用于 **Milkyway Idle** 的用户脚本，面向以强化和市场交易为主的玩家。它的目标是帮助筛选可能赚钱的强化项目，并结合自己的市场成交记录统计近期强化收益。
+用于 **Milkyway Idle** 的个人强化与市场分析用户脚本。它不保存强化收益账本，也不尝试推断真实历史利润；所有结果均基于当前市场价格和当前角色数据即时计算。
 
 ## 功能
 
-- 根据市场报价估算强化投入、成品价值和预期收益。
-- 从游戏的强化完成消息读取最终强化等级；只有拿到服务器最终等级的批次才会进入收益账本。
-- 使用个人市场成交记录，以 FIFO（先进先出）方式把售出成品和对应强化批次关联，显示实际成交收益。
-- 显示掉落与经验记录中的强化结果和账本状态。
-- 在“强化收益”面板中查看、筛选、导出和清空当前账本。
+- 在强化相关市场页面显示预期成本、税后收益和工时费。
+- 在玩家名字左侧提供“工具箱”按钮；打开后可进入“强化榜”。
+- 强化榜仅筛选有收购价的强化成品，可按工时费/h、风控工时费/h 或经验/h 排序。
+- 强化榜使用最高收购价（Bid）和 5% 交易税计算税后收入；模拟和排序均在浏览器本地完成。
+- 在“掉落与经验记录”中识别强化记录，按当前出售价比较实际材料/保护消耗与同一目标的预期消耗。
+- 掉落记录不再给强化过程标记“成功”或“失败”，也不会保存、合并或结算历史强化收益。
+- 工具箱位置不干预游戏原生标签页，也不与其他脚本的标签切换逻辑耦合。
 
-## 安装与自动更新
+## 依赖与数据
 
-1. 安装浏览器用户脚本管理器，例如 Tampermonkey 或 Violentmonkey。
+- 需要安装 [MWITools](https://github.com/doh-nuts/MWITools) 以提供本地市场缓存；脚本兼容 MWITools 26.4.8 的缓存和物品名称映射。
+- 强化榜启动时读取一次公开市场快照，不携带游戏登录凭据；不会按物品或订单逐项请求。
+- 掉落与经验记录的成本比较读取 MWITools 已缓存的市场价格。价格变化后，重新打开该页面或点击游戏原有“刷新”即可重新估值。
+- 风控工时费还会读取 MWITools 展示或保存的流动资产；无法读取时仅隐藏风控数值，不影响普通工时费和经验/h。
+
+## 安装与更新
+
+1. 安装 Tampermonkey、Violentmonkey 等用户脚本管理器。
 2. 打开 [mwi-enhance-helper.user.js](https://raw.githubusercontent.com/Anzaynt/mwi-enhance-helper/main/mwi-enhance-helper.user.js) 并确认安装。
-3. 脚本管理器会使用脚本头部的更新地址检查更新。若未自动更新，可从上面的链接重新安装。
+3. 确保 MWITools 已安装并完成市场数据加载。
+4. 脚本管理器会根据脚本头部的更新地址检查更新；未自动更新时可重新打开上述链接安装。
 
 ## 使用说明
 
-- 进入游戏后，脚本会在掉落与经验记录附近显示“强化收益”入口。
-- 强化完成后，打开掉落与经验记录；脚本收到带最终装备等级的服务器完成消息后，会自动保存该批次。
-- 卖出强化成品后，再打开“强化收益”即可看到与市场成交记录对应的实际收益。
-- 新版账本从空白开始，以避免旧版本曾保存的未确认记录影响计算。
+1. 进入游戏后，在玩家名字左侧点击“工具箱”。
+2. 选择“强化榜”。首次打开会按当前 Buff、装备和市场快照进行完整本地计算；完成后会显示本次计算耗时。
+3. 使用排行榜中的筛选、排序和“本地重算”按钮比较项目。关闭后在同一页面会话内再次打开会复用已算出的结果。
+4. 查看“掉落与经验记录”时，脚本会显示本次强化的材料、保护、总消耗，以及相对预期的差异。该显示是当前价格下的即时估值，不是实际成交收益。
 
-## 数据与限制
+## 限制
 
-- 所有记录保存在浏览器本地；脚本不会上传市场记录或角色数据。
-- 只有脚本运行期间捕获到的强化完成消息和市场记录能用于精确对账。
-- 如果缺少最终等级完成包，脚本会明确标为“未入账”，不会根据掉落分布猜测最终等级。
-
-## 致谢与贡献
-
-本项目整合、改造了社区中多位作者的 Milkyway Idle 用户脚本思路与片段；原始脚本头部保留了已知作者署名（包括 wangchyan、柒雨、PaperCat 等）。感谢这些前人的工作。
-
-该项目由 GPT 协助开发、排查和整理，人类负责需求、验证和发布。欢迎提交 Issue 或 Pull Request，尤其欢迎提供可复现的强化完成包、市场成交包或 Bug 截图来帮助修复问题。
+- 市场报价会变化；排行榜和掉落记录的估值不等同于实际成交价或历史成本。
+- 强化榜只列出当前有有效收购价、且所需成本价格可读的项目。
+- 强化模拟会根据角色的当前强化相关 Buff 和等级计算；切换 Buff、装备或市场价格后应使用“本地重算”。
+- 本脚本不记录个人市场交易、强化历史或角色数据。
 
 ## 许可证
 
@@ -47,40 +52,45 @@
 
 # Milkyway Idle Enhance Helper
 
-This userscript for **Milkyway Idle** is aimed at players who enhance items and trade them on the market. It helps identify potentially profitable enhancement projects and tracks recent enhancement profit using the player's own market activity.
+A personal enhancement and market-analysis userscript for **Milkyway Idle**. It does not keep a profit ledger or infer historical realized profit. Results are live estimates based on current market prices and current character data.
 
 ## Features
 
-- Estimates enhancement input cost, output value, and expected profit from market quotes.
-- Reads the final enhancement level from the game's server completion message; only batches with a server-confirmed final level enter the profit ledger.
-- Matches sold enhanced items to enhancement batches with FIFO accounting and shows realized sale profit when available.
-- Adds enhancement-result and ledger status to the loot/experience log.
-- Provides an Enhancement Profit panel for viewing, filtering, exporting, and clearing the current ledger.
+- Shows expected cost, after-tax return, and hourly value on enhancement-related market pages.
+- Adds a **Toolkit** button to the left of the player name, with an **Enhancement Ranking** entry.
+- Ranks only enhanced products with active buy orders, sortable by hourly value, risk-adjusted hourly value, or experience per hour.
+- Uses the highest buy order (Bid) and a 5% market tax; simulation and ranking run locally in the browser.
+- Detects enhancement rows in the loot/experience log and compares recorded material/protection consumption with the expected consumption for the same target.
+- Does not label enhancement runs as success/failure and does not save, merge, or settle historical enhancement-profit records.
+- Does not modify the game’s native tab system or depend on other scripts’ tab switching.
+
+## Dependencies and data
+
+- [MWITools](https://github.com/doh-nuts/MWITools) is required for its local market cache. This script supports MWITools 26.4.8 cache and item-name mappings.
+- The ranking reads one public market snapshot when the script starts, without game login credentials. It never sends one request per item or order.
+- Loot-log comparisons use the price cache already stored by MWITools. Reopen the view or use the game’s built-in refresh after prices change.
+- Risk-adjusted hourly value also reads the liquid-assets value exposed or stored by MWITools. If unavailable, only that column is unavailable.
 
 ## Installation and updates
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
 2. Open [mwi-enhance-helper.user.js](https://raw.githubusercontent.com/Anzaynt/mwi-enhance-helper/main/mwi-enhance-helper.user.js) and confirm installation.
-3. Your userscript manager checks the update URL in the metadata automatically. Reinstall from the link above if an update is not detected.
+3. Install MWITools and let it load market data.
+4. The userscript manager checks the metadata update URL automatically; reinstall from the link above if needed.
 
 ## Usage
 
-- Open the game and use the **Enhancement Profit** entry near the loot/experience log.
-- After an enhancement queue finishes, open the loot/experience log. The batch is saved automatically once the script receives the server packet containing the final item level.
-- After selling the enhanced item, reopen **Enhancement Profit** to view the matched realized result.
-- The new ledger intentionally starts empty so provisional records written by older versions cannot corrupt new calculations.
+1. In game, click **Toolkit** to the left of the player name.
+2. Choose **Enhancement Ranking**. The first opening performs a full local calculation using the current buffs, equipment, and market snapshot; the elapsed time is shown when it finishes.
+3. Filter, sort, or use **Recalculate locally** to compare projects. Reopening within the same page session reuses the completed result.
+4. In the loot/experience log, review the material, protection, and total-cost difference from expectation. This is a live valuation, not realized sale profit.
 
-## Data and limitations
+## Limitations
 
-- Data stays in the browser locally; the script does not upload character or market data.
-- Exact accounting requires the script to observe both the enhancement completion packet and market activity while it is running.
-- A missing final-level packet is shown as **not recorded**. The script never guesses a final level from the distribution of intermediate drops.
-
-## Credits and contributions
-
-This project integrates and adapts ideas and portions from several community Milkyway Idle userscripts. Known original authors remain credited in the source metadata, including wangchyan, 柒雨, and PaperCat. Thank you to everyone whose earlier work made this project possible.
-
-GPT assisted with implementation, debugging, and documentation; a human directed the requirements, testing, and release. Bug reports and pull requests are welcome. Reproducible completion packets, market packets, or screenshots are particularly helpful when reporting a bug.
+- Market quotes change. Rankings and loot-log values are not actual fill prices or historical cost basis.
+- The ranking includes only products with a valid current buy order and readable input prices.
+- Simulation uses the current enhancement-related buffs and levels. Recalculate after changing buffs, equipment, or market prices.
+- The script does not record personal market trades, enhancement history, or character data.
 
 ## License
 
