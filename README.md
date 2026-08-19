@@ -10,15 +10,13 @@
 - 在玩家名字左侧提供“工具箱”按钮；打开后可进入“强化榜”。
 - 强化榜仅筛选有收购价的强化成品，可按工时费/h、风控工时费/h 或经验/h 排序。
 - 强化榜使用最高收购价（Bid）和 5% 交易税计算税后收入；模拟和排序均在浏览器本地完成。
-- 在“掉落与经验记录”中识别强化记录，按当前出售价比较实际材料/保护消耗与同一目标的预期消耗。
-- 掉落记录不再给强化过程标记“成功”或“失败”，也不会保存、合并或结算历史强化收益。
 - 工具箱位置不干预游戏原生标签页，也不与其他脚本的标签切换逻辑耦合。
+- 强化榜会排除强化材料中存在当前不可购买物品的项目，例如部分配饰。
 
 ## 依赖与数据
 
 - 需要安装 [MWITools](https://github.com/doh-nuts/MWITools) 以提供本地市场缓存；脚本兼容 MWITools 26.4.8 的缓存和物品名称映射。
 - 强化榜启动时读取一次公开市场快照，不携带游戏登录凭据；不会按物品或订单逐项请求。
-- 掉落与经验记录的成本比较读取 MWITools 已缓存的市场价格。价格变化后，重新打开该页面或点击游戏原有“刷新”即可重新估值。
 - 风控工时费还会读取 MWITools 展示或保存的流动资产；无法读取时仅隐藏风控数值，不影响普通工时费和经验/h。
 
 ## 安装与更新
@@ -33,14 +31,13 @@
 1. 进入游戏后，在玩家名字左侧点击“工具箱”。
 2. 选择“强化榜”。首次打开会按当前 Buff、装备和市场快照进行完整本地计算；完成后会显示本次计算耗时。
 3. 使用排行榜中的筛选、排序和“本地重算”按钮比较项目。关闭后在同一页面会话内再次打开会复用已算出的结果。
-4. 查看“掉落与经验记录”时，脚本会显示本次强化的材料、保护、总消耗，以及相对预期的差异。该显示是当前价格下的即时估值，不是实际成交收益。
 
 ## 限制
 
-- 市场报价会变化；排行榜和掉落记录的估值不等同于实际成交价或历史成本。
-- 强化榜只列出当前有有效收购价、且所需成本价格可读的项目。
+- 市场报价会变化；排行榜估值不等同于实际成交价或历史成本。
+- 强化榜只列出当前有有效收购价、且所有强化材料均存在可购买价格的项目。
 - 强化模拟会根据角色的当前强化相关 Buff 和等级计算；切换 Buff、装备或市场价格后应使用“本地重算”。
-- 本脚本不记录个人市场交易、强化历史或角色数据。
+- 本脚本不记录个人市场交易、强化历史或收益数据。
 
 ## 许可证
 
@@ -60,15 +57,13 @@ A personal enhancement and market-analysis userscript for **Milkyway Idle**. It 
 - Adds a **Toolkit** button to the left of the player name, with an **Enhancement Ranking** entry.
 - Ranks only enhanced products with active buy orders, sortable by hourly value, risk-adjusted hourly value, or experience per hour.
 - Uses the highest buy order (Bid) and a 5% market tax; simulation and ranking run locally in the browser.
-- Detects enhancement rows in the loot/experience log and compares recorded material/protection consumption with the expected consumption for the same target.
-- Does not label enhancement runs as success/failure and does not save, merge, or settle historical enhancement-profit records.
 - Does not modify the game’s native tab system or depend on other scripts’ tab switching.
+- Excludes ranking projects whose enhancement costs contain an item with no currently buyable price, including some accessory categories.
 
 ## Dependencies and data
 
 - [MWITools](https://github.com/doh-nuts/MWITools) is required for its local market cache. This script supports MWITools 26.4.8 cache and item-name mappings.
 - The ranking reads one public market snapshot when the script starts, without game login credentials. It never sends one request per item or order.
-- Loot-log comparisons use the price cache already stored by MWITools. Reopen the view or use the game’s built-in refresh after prices change.
 - Risk-adjusted hourly value also reads the liquid-assets value exposed or stored by MWITools. If unavailable, only that column is unavailable.
 
 ## Installation and updates
@@ -83,14 +78,13 @@ A personal enhancement and market-analysis userscript for **Milkyway Idle**. It 
 1. In game, click **Toolkit** to the left of the player name.
 2. Choose **Enhancement Ranking**. The first opening performs a full local calculation using the current buffs, equipment, and market snapshot; the elapsed time is shown when it finishes.
 3. Filter, sort, or use **Recalculate locally** to compare projects. Reopening within the same page session reuses the completed result.
-4. In the loot/experience log, review the material, protection, and total-cost difference from expectation. This is a live valuation, not realized sale profit.
 
 ## Limitations
 
-- Market quotes change. Rankings and loot-log values are not actual fill prices or historical cost basis.
-- The ranking includes only products with a valid current buy order and readable input prices.
+- Market quotes change. Rankings are not actual fill prices or historical cost basis.
+- The ranking includes only products with a valid current buy order and currently buyable prices for every enhancement material.
 - Simulation uses the current enhancement-related buffs and levels. Recalculate after changing buffs, equipment, or market prices.
-- The script does not record personal market trades, enhancement history, or character data.
+- The script does not record personal market trades, enhancement history, or profit data.
 
 ## License
 
