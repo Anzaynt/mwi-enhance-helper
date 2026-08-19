@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Milkyway Idle - Enhance Helper
 // @namespace    https://github.com/Anzaynt/mwi-enhance-helper
-// @version      1.9.0
-// @description  Header toolbox with enhancement ranking and live expected-cost comparisons without persistent profit history.
+// @version      1.11.0
+// @description  Header toolbox with enhancement ranking and a live stop/continue EV helper.
 // @author       Anzaynt
 // @license      MIT
 // @homepageURL   https://github.com/Anzaynt/mwi-enhance-helper
@@ -2246,6 +2246,13 @@
       return marketAsk;
     }
 
+    // 只取市场订单簿左一卖单，不混入商店价格；用于白板的当前市场估值。
+    function getMarketListingAskPrice(hrid, enhanceLevel = 0) {
+      const itemCache = getMarketCache()[hrid];
+      const ask = itemCache?.[enhanceLevel]?.a;
+      return Number.isFinite(ask) && ask > 0 ? ask : 0;
+    }
+
     function getMarketBidPrice(hrid, enhanceLevel = 0) {
       const cache = getMarketCache();
       const itemCache = cache[hrid];
@@ -3444,6 +3451,426 @@
     }
 
     // ═══════════════════════════════════════════════
+    //  强化决策辅助（独立于既有强化榜与工时费计算）
+    //  已发生账本只用于本次实际盈亏；Bellman EV 仅从当前等级开始。
+    // ═══════════════════════════════════════════════
+
+    const enhancementDecision = {
+      itemHrid: null,
+      itemName: "",
+      currentLevel: null,
+      targetLevel: 20,
+      protectLevel: 1,
+      protectionItemHrid: null,
+      lastActionCount: null,
+      actions: 0,
+      successes: 0,
+      failures: 0,
+      leaps: 0,
+      protectionUses: 0
+    };
+
+    function clampEnhancementLevel(value, fallback = 0) {
+      const level = Number(value);
+      return Number.isInteger(level) && level >= 0 && level <= 20 ? level : fallback;
+    }
+
+    function parseEnhancementItemHash(hash) {
+      const parts = String(hash || "").split("::");
+      const itemHrid = parts.find((part) => part.startsWith("/items/")) || "";
+      return {
+        itemHrid,
+        level: clampEnhancementLevel(parts[parts.length - 1], null)
+      };
+    }
+
+    function getPreviousEnhancementLevel(message, action, itemHrid) {
+      const items = Array.isArray(message?.endCharacterItems) ? message.endCharacterItems : [];
+      const candidates = items.filter((item) =>
+        item?.itemHrid === itemHrid && item.hash !== action.primaryItemHash
+      );
+      const previous = candidates.length === 1
+        ? candidates[0]
+        : candidates.find((item) => item.hash !== action.secondaryItemHash);
+      return clampEnhancementLevel(previous?.enhancementLevel, null);
+    }
+
+    function resetEnhancementDecision(itemHrid, itemName, currentLevel, targetLevel, protectLevel) {
+      Object.assign(enhancementDecision, {
+        itemHrid,
+        itemName,
+        currentLevel,
+        targetLevel,
+        protectLevel,
+        protectionItemHrid: null,
+        lastActionCount: null,
+        actions: 0,
+        successes: 0,
+        failures: 0,
+        leaps: 0,
+        protectionUses: 0
+      });
+    }
+
+    function handleEnhancementActionCompleted(message) {
+      const action = message?.endCharacterAction;
+      if (action?.actionHrid !== ENHANCE_ACTION_HRID) return;
+
+      const parsed = parseEnhancementItemHash(action.primaryItemHash);
+      if (!parsed.itemHrid || parsed.level === null) return;
+      const state = getGameState();
+      const item = getItemDetail(parsed.itemHrid, state);
+      const itemName = PRIVATE_ZH_ITEM_HRIDS[parsed.itemHrid]
+        || PRIVATE_ZH_ITEM_NAMES[item?.name]
+        || item?.name
+        || parsed.itemHrid.split("/").pop().replaceAll("_", " ");
+      const targetLevel = clampEnhancementLevel(action.enhancingMaxLevel, 20);
+      const protectLevel = Math.max(1, Math.min(targetLevel, clampEnhancementLevel(action.enhancingProtectionMinLevel, 1)));
+      const actionCount = Number(action.currentCount);
+      const shouldReset = enhancementDecision.itemHrid !== parsed.itemHrid
+        || (Number.isFinite(actionCount) && enhancementDecision.lastActionCount !== null
+          && actionCount <= enhancementDecision.lastActionCount);
+      if (shouldReset || !enhancementDecision.itemHrid) {
+        resetEnhancementDecision(parsed.itemHrid, itemName, parsed.level, targetLevel, protectLevel);
+      }
+
+      const previousLevel = getPreviousEnhancementLevel(message, action, parsed.itemHrid);
+      if (previousLevel !== null) {
+        enhancementDecision.actions += 1;
+        if (parsed.level > previousLevel) {
+          enhancementDecision.successes += 1;
+          if (parsed.level - previousLevel >= 2) enhancementDecision.leaps += 1;
+        } else {
+          enhancementDecision.failures += 1;
+          if (previousLevel >= protectLevel) enhancementDecision.protectionUses += 1;
+        }
+      }
+      const secondary = parseEnhancementItemHash(action.secondaryItemHash);
+      if (secondary.itemHrid) enhancementDecision.protectionItemHrid = secondary.itemHrid;
+      enhancementDecision.itemName = itemName;
+      enhancementDecision.currentLevel = parsed.level;
+      enhancementDecision.targetLevel = targetLevel;
+      enhancementDecision.protectLevel = protectLevel;
+      enhancementDecision.lastActionCount = Number.isFinite(actionCount) ? actionCount : enhancementDecision.lastActionCount;
+      ensureEnhancementDecisionPanel();
+    }
+
+    function getEnhancementTransitionRates(itemHrid, level, buffs, state) {
+      const icd = getInitClientData();
+      const item = getItemDetail(itemHrid, state);
+      const baseRate = icd?.enhancementLevelSuccessRateTable?.[level];
+      if (!item || !Number.isFinite(baseRate)) return null;
+      const playerLevel = getSkillLevel(state, ENHANCE_SKILL_HRID) + getBuffOf(buffs, "Level");
+      const itemLevel = item.itemLevel || 0;
+      const levelRatio = playerLevel >= itemLevel
+        ? (playerLevel - itemLevel) * 0.0005
+        : -0.5 * (1 - playerLevel / itemLevel);
+      const success = Math.min(1, Math.max(0, baseRate * (1 + levelRatio + getBuffOf(buffs, "Success"))));
+      const blessed = getBuffOf(buffs, "Blessed");
+      return {
+        success,
+        normal: Math.min(1, success * (1 - blessed)),
+        leap: success * blessed,
+        failure: Math.max(0, 1 - success)
+      };
+    }
+
+    function getEnhancementDecisionCostModel(itemHrid, protectLevel, targetLevel, state) {
+      const item = getItemDetail(itemHrid, state);
+      if (!item) return { error: "无法读取强化物品资料。" };
+      let materialPerAction = 0;
+      for (const cost of item.enhancementCosts || []) {
+        const price = getMarketAskPrice(cost.itemHrid, 0);
+        if (price <= 0) return { error: `强化材料没有可购买价格：${cost.itemHrid}` };
+        materialPerAction += (Number(cost.count) || 0) * price;
+      }
+
+      const needsProtection = protectLevel < targetLevel;
+      if (!needsProtection) return { materialPerAction, protectionPrice: 0, protectionHrid: null };
+      const candidates = [];
+      const possibleHrids = item.protectionItemHrids?.length > 0
+        ? item.protectionItemHrids
+        : [itemHrid];
+      for (const hrid of possibleHrids.concat("/items/mirror_of_protection")) {
+        const price = getMarketAskPrice(hrid, 0);
+        if (price > 0) candidates.push({ hrid, price });
+      }
+      if (candidates.length === 0) return { error: "保护道具没有可购买价格，无法估算保护失败成本。" };
+      const selected = candidates.find((candidate) => candidate.hrid === enhancementDecision.protectionItemHrid)
+        || candidates.reduce((best, candidate) => candidate.price < best.price ? candidate : best);
+      return { materialPerAction, protectionPrice: selected.price, protectionHrid: selected.hrid };
+    }
+
+    function solveEnhancementStopPolicy(itemHrid, currentLevel, targetLevel, protectLevel, costs, buffs, state) {
+      const maxLevel = Math.min(20, targetLevel);
+      const bids = Array.from({ length: maxLevel + 1 }, (_, level) => getMarketBidPrice(itemHrid, level) * SELL_TAX_FACTOR);
+      if (bids[maxLevel] <= 0) return { error: `+${maxLevel} 没有最高求购价，无法确认递归策略的最终退出价值。` };
+      const transitions = [];
+      for (let level = 0; level < maxLevel; level++) {
+        const rates = getEnhancementTransitionRates(itemHrid, level, buffs, state);
+        if (!rates) return { error: `无法读取 +${level} 的游戏当前强化成功率。` };
+        transitions[level] = {
+          rates,
+          cost: costs.materialPerAction + (level >= protectLevel ? rates.failure * costs.protectionPrice : 0),
+          next: [
+            { level: Math.min(maxLevel, level + 1), probability: rates.normal },
+            { level: Math.min(maxLevel, level + 2), probability: rates.leap },
+            { level: level >= protectLevel ? Math.max(0, level - 1) : 0, probability: rates.failure }
+          ]
+        };
+      }
+
+      let policy = Array.from({ length: maxLevel + 1 }, (_, level) => level === maxLevel || bids[level] > 0 ? "stop" : "continue");
+      function evaluatePolicy(activePolicy) {
+        const continueLevels = [];
+        for (let level = 0; level < maxLevel; level++) if (activePolicy[level] === "continue") continueLevels.push(level);
+        const index = new Map(continueLevels.map((level, i) => [level, i]));
+        const size = continueLevels.length;
+        const matrix = Array.from({ length: size }, (_, i) => {
+          const row = new Array(size).fill(0);
+          row[i] = 1;
+          return row;
+        });
+        const costRhs = new Array(size).fill(0);
+        const revenueRhs = new Array(size).fill(0);
+        const actionsRhs = new Array(size).fill(1);
+        for (const level of continueLevels) {
+          const row = index.get(level);
+          costRhs[row] = transitions[level].cost;
+          for (const step of transitions[level].next) {
+            const nextRow = index.get(step.level);
+            if (nextRow !== undefined) matrix[row][nextRow] -= step.probability;
+            else revenueRhs[row] += step.probability * bids[step.level];
+          }
+        }
+        const inverse = size > 0 ? invertMatrix(matrix) : [];
+        if (size > 0 && !inverse) return null;
+        const costPart = size > 0 ? matVecMul(inverse, costRhs) : [];
+        const revenuePart = size > 0 ? matVecMul(inverse, revenueRhs) : [];
+        const actionsPart = size > 0 ? matVecMul(inverse, actionsRhs) : [];
+        const result = Array.from({ length: maxLevel + 1 }, (_, level) => ({
+          cost: 0,
+          revenue: bids[level],
+          actions: 0,
+          value: bids[level]
+        }));
+        for (const level of continueLevels) {
+          const row = index.get(level);
+          result[level] = {
+            cost: costPart[row],
+            revenue: revenuePart[row],
+            actions: actionsPart[row],
+            value: revenuePart[row] - costPart[row]
+          };
+          if (!Number.isFinite(result[level].value) || result[level].actions < 0) return null;
+        }
+        return result;
+      }
+
+      let values = null;
+      for (let iteration = 0; iteration < 40; iteration++) {
+        values = evaluatePolicy(policy);
+        if (!values) return { error: "当前成功率与求购单无法形成可收敛的退出策略。" };
+        let changed = false;
+        for (let level = 0; level < maxLevel; level++) {
+          if (bids[level] <= 0) continue;
+          const transition = transitions[level];
+          const futureValue = transition.next.reduce((sum, step) => sum + step.probability * values[step.level].value, -transition.cost);
+          const nextPolicy = futureValue > bids[level] + 1e-8 ? "continue" : "stop";
+          if (nextPolicy !== policy[level]) {
+            policy[level] = nextPolicy;
+            changed = true;
+          }
+        }
+        if (!changed) break;
+      }
+      values = evaluatePolicy(policy);
+      if (!values) return { error: "递归 EV 计算未收敛。" };
+      const current = transitions[currentLevel];
+      if (!current) return { values, policy, bids, transitions, forcedContinue: null };
+      const forcedContinue = current.next.reduce((result, step) => {
+        const future = values[step.level];
+        result.cost += step.probability * future.cost;
+        result.revenue += step.probability * future.revenue;
+        result.actions += step.probability * future.actions;
+        return result;
+      }, { cost: current.cost, revenue: 0, actions: 1 });
+      forcedContinue.value = forcedContinue.revenue - forcedContinue.cost;
+      return { values, policy, bids, transitions, forcedContinue };
+    }
+
+    function formatDecisionMoney(value) {
+      return Number.isFinite(value) ? formatMoney(value) : "无法计算";
+    }
+
+    const ENHANCEMENT_DECISION_FLOAT_KEY = "MWI_enhancementDecisionFloat";
+    let enhancementDecisionFloat = (() => {
+      try {
+        const saved = JSON.parse(localStorage.getItem(ENHANCEMENT_DECISION_FLOAT_KEY) || "{}");
+        return {
+          collapsed: Boolean(saved.collapsed),
+          left: Number.isFinite(saved.left) ? saved.left : null,
+          top: Number.isFinite(saved.top) ? saved.top : null
+        };
+      } catch (_) {
+        return { collapsed: false, left: null, top: null };
+      }
+    })();
+    let enhancementDecisionDragging = null;
+
+    function saveEnhancementDecisionFloat() {
+      try {
+        localStorage.setItem(ENHANCEMENT_DECISION_FLOAT_KEY, JSON.stringify(enhancementDecisionFloat));
+      } catch (_) {}
+    }
+
+    function positionEnhancementDecisionFloat(panel) {
+      if (Number.isFinite(enhancementDecisionFloat.left) && Number.isFinite(enhancementDecisionFloat.top)) {
+        panel.style.left = `${enhancementDecisionFloat.left}px`;
+        panel.style.top = `${enhancementDecisionFloat.top}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      } else {
+        panel.style.left = "auto";
+        panel.style.top = "auto";
+        panel.style.right = "14px";
+        panel.style.bottom = "14px";
+      }
+    }
+
+    function toggleEnhancementDecisionFloat() {
+      enhancementDecisionFloat.collapsed = !enhancementDecisionFloat.collapsed;
+      saveEnhancementDecisionFloat();
+      ensureEnhancementDecisionPanel();
+    }
+
+    function bindEnhancementDecisionFloat(panel) {
+      panel.addEventListener("click", (event) => {
+        if (event.target?.closest?.('[data-role="float-toggle"]')) {
+          if (!enhancementDecisionDragging?.moved) toggleEnhancementDecisionFloat();
+        }
+      });
+      panel.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.target?.closest?.('[data-role="float-toggle"]')
+          || !event.target?.closest?.('[data-role="float-drag-handle"]')) return;
+        const rect = panel.getBoundingClientRect();
+        enhancementDecisionDragging = {
+          panel,
+          offsetX: event.clientX - rect.left,
+          offsetY: event.clientY - rect.top,
+          moved: false
+        };
+        panel.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+      });
+      panel.addEventListener("pointermove", (event) => {
+        const drag = enhancementDecisionDragging;
+        if (!drag || drag.panel !== panel) return;
+        const width = panel.offsetWidth;
+        const height = panel.offsetHeight;
+        const left = Math.max(0, Math.min(window.innerWidth - width, event.clientX - drag.offsetX));
+        const top = Math.max(0, Math.min(window.innerHeight - height, event.clientY - drag.offsetY));
+        drag.moved = true;
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+        enhancementDecisionFloat.left = left;
+        enhancementDecisionFloat.top = top;
+      });
+      const endDrag = (event) => {
+        const drag = enhancementDecisionDragging;
+        if (!drag || drag.panel !== panel) return;
+        panel.releasePointerCapture?.(event.pointerId);
+        enhancementDecisionDragging = null;
+        if (drag.moved) {
+          saveEnhancementDecisionFloat();
+          window.setTimeout(() => { enhancementDecisionDragging = null; }, 0);
+        }
+      };
+      panel.addEventListener("pointerup", endDrag);
+      panel.addEventListener("pointercancel", endDrag);
+    }
+
+    function ensureEnhancementDecisionPanel() {
+      let panel = document.getElementById("mwi-enhance-decision-panel");
+      if (!panel) {
+        panel = document.createElement("section");
+        panel.id = "mwi-enhance-decision-panel";
+        document.body.append(panel);
+        bindEnhancementDecisionFloat(panel);
+      }
+      panel.hidden = false;
+      positionEnhancementDecisionFloat(panel);
+      if (enhancementDecisionFloat.collapsed) {
+        panel.innerHTML = `<style>#mwi-enhance-decision-panel{position:fixed;z-index:2147483642;min-width:0;color:#eef2ff;font:12px/1.3 sans-serif}#mwi-enhance-decision-panel .med-mini{display:flex;align-items:center;gap:5px;padding:7px 9px;border:1px solid #6070ae;border-radius:18px;background:rgba(27,32,51,.88);box-shadow:0 5px 18px rgba(0,0,0,.42);user-select:none}#mwi-enhance-decision-panel .med-drag{cursor:grab;color:#aebbe8;font-weight:700}#mwi-enhance-decision-panel .med-drag:active{cursor:grabbing}#mwi-enhance-decision-panel button{border:0;background:transparent;color:#fff;font:700 12px/1 sans-serif;cursor:pointer}</style><div class="med-mini" title="拖动图标移动；点击文字展开"><span class="med-drag" data-role="float-drag-handle">⠿</span><button type="button" data-role="float-toggle">强化 EV ${enhancementDecision.currentLevel === null ? "" : `+${enhancementDecision.currentLevel}`}</button></div>`;
+        return;
+      }
+      if (!enhancementDecision.itemHrid || enhancementDecision.currentLevel === null) {
+        panel.innerHTML = `<style>#mwi-enhance-decision-panel{position:fixed;z-index:2147483642;width:min(420px,calc(100vw - 28px));min-width:0;padding:10px;border:1px solid #49516f;border-radius:7px;background:rgba(32,36,53,.90);box-shadow:0 8px 26px rgba(0,0,0,.45);color:#dfe5ff;font:12px/1.45 sans-serif}#mwi-enhance-decision-panel .med-wait-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}.med-drag{cursor:grab;color:#aebbe8;font-weight:700}.med-drag:active{cursor:grabbing}.med-collapse{border:0;border-radius:3px;background:#3a4265;color:#fff;cursor:pointer}</style><div class="med-wait-head"><span class="med-drag" data-role="float-drag-handle" title="拖动浮窗">⠿ 强化停止 / 继续 EV</span><button class="med-collapse" type="button" data-role="float-toggle" title="收起">−</button></div><div style="color:#aeb8d8">等待本脚本捕获下一次强化完成事件；统计从脚本加载后开始。</div>`;
+        return;
+      }
+      const state = getGameState();
+      const buffs = state ? computeEnhancingBuffs(state) : null;
+      const level = enhancementDecision.currentLevel;
+      const target = enhancementDecision.targetLevel;
+      const protection = enhancementDecision.protectLevel;
+      const currentBid = getMarketBidPrice(enhancementDecision.itemHrid, level);
+      const stopValue = currentBid > 0 ? currentBid * SELL_TAX_FACTOR : null;
+      const costModel = state ? getEnhancementDecisionCostModel(enhancementDecision.itemHrid, protection, target, state) : { error: "无法读取游戏状态。" };
+      const whiteboardAsk = getMarketListingAskPrice(enhancementDecision.itemHrid, 0);
+      const historicalCost = costModel.error || whiteboardAsk <= 0 ? null
+        : enhancementDecision.actions * costModel.materialPerAction
+          + enhancementDecision.protectionUses * costModel.protectionPrice
+          + whiteboardAsk;
+      const actualPnl = stopValue === null || historicalCost === null ? null : stopValue - historicalCost;
+      const ev = costModel.error || !buffs ? { error: costModel.error || "无法读取当前强化 Buff。" }
+        : solveEnhancementStopPolicy(enhancementDecision.itemHrid, level, target, protection, costModel, buffs, state);
+      const rates = level < target && buffs ? getEnhancementTransitionRates(enhancementDecision.itemHrid, level, buffs, state) : null;
+      let decisionHtml;
+      if (stopValue === null) {
+        decisionHtml = `<div class="med-hero med-warning"><strong>暂无法比较停止与继续</strong><span>当前 +${level} 没有有效求购单；未使用卖单价替代。</span>${ev.forcedContinue ? `<b>继续后的期望净值：${formatDecisionMoney(ev.forcedContinue.value)}</b>` : ""}</div>`;
+      } else if (ev.error || !ev.forcedContinue) {
+        decisionHtml = `<div class="med-hero med-warning"><strong>当前建议停止</strong><span>${escapeRankingHtml(ev.error || "已达到可强化上限，无法继续强化。")}</span><b>现在停止税后收入：${formatDecisionMoney(stopValue)}</b></div>`;
+      } else {
+        const difference = ev.forcedContinue.value - stopValue;
+        const favorable = difference >= 0 ? "继续优势" : "停止优势";
+        const color = difference >= 0 ? "#78df9f" : "#ff9a9a";
+        decisionHtml = `<div class="med-hero" style="border-color:${color}"><div class="med-hero-title" style="color:${color}">${favorable} ${formatDecisionMoney(Math.abs(difference))}</div><div class="med-primary-grid"><div><span>现在停止</span><b>${formatDecisionMoney(stopValue)}</b><small>最高求购价税后</small></div><div><span>继续后的 EV</span><b>${formatDecisionMoney(ev.forcedContinue.value)}</b><small>不含已发生历史成本</small></div><div><span>优势差</span><b style="color:${color}">${formatDecisionMoney(Math.abs(difference))}</b><small>继续一手后的递归策略</small></div></div></div>`;
+      }
+      const observedRate = enhancementDecision.actions > 0
+        ? `${(enhancementDecision.successes / enhancementDecision.actions * 100).toFixed(1)}%`
+        : "—";
+      const bidLevels = Array.from({ length: target + 1 }, (_, bidLevel) => {
+        const bid = getMarketBidPrice(enhancementDecision.itemHrid, bidLevel);
+        return `<span>+${bidLevel}：${bid > 0 ? formatMoney(bid) : "无求购"}</span>`;
+      }).join("");
+      const policySummary = !ev.error && ev.policy
+        ? ev.policy.map((choice, policyLevel) => `+${policyLevel}${choice === "stop" ? "停" : "续"}`).join(" · ")
+        : "—";
+      const futureHtml = !ev.error && ev.forcedContinue
+        ? `<div class="med-detail-grid"><div>期望支出 <b>${formatDecisionMoney(ev.forcedContinue.cost)}</b></div><div>期望税后收入 <b>${formatDecisionMoney(ev.forcedContinue.revenue)}</b></div><div>预计后续行动 <b>${ev.forcedContinue.actions.toFixed(2)} 次</b></div></div>`
+        : "";
+      panel.innerHTML = `
+        <style>
+          #mwi-enhance-decision-panel{position:fixed;z-index:2147483642;width:min(520px,calc(100vw - 28px));min-width:0;padding:10px;border:1px solid #49516f;border-radius:7px;background:rgba(32,36,53,.90);box-shadow:0 8px 26px rgba(0,0,0,.45);color:#dfe5ff;font:12px/1.45 sans-serif;overflow-wrap:anywhere}
+          #mwi-enhance-decision-panel *{box-sizing:border-box}#mwi-enhance-decision-panel h4{display:inline;margin:0;font-size:14px;color:#fff}.med-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:7px}.med-head>span{color:#aeb8d8}.med-drag{cursor:grab;color:#aebbe8;font-weight:700;user-select:none}.med-drag:active{cursor:grabbing}.med-collapse{border:0;border-radius:3px;background:#3a4265;color:#fff;cursor:pointer;font-size:16px;line-height:17px}.med-note{margin:4px 0;color:#aeb8d8}.med-hero{margin:7px 0;padding:8px;border:1px solid #58627f;border-radius:5px;background:#252b40}.med-hero-title{margin-bottom:6px;font-size:16px;font-weight:800}.med-hero strong,.med-hero span,.med-hero b{display:block}.med-hero span{margin:3px 0;color:#d6dbec}.med-warning{color:#ffd58b}.med-primary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.med-primary-grid>div{min-width:0;padding:6px;border-radius:4px;background:#1d2132}.med-primary-grid span,.med-primary-grid small{display:block;color:#aeb8d8}.med-primary-grid b{display:block;margin:1px 0;color:#fff;font-size:15px}.med-detail-grid{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px 0;color:#c8cee5}.med-detail-grid b{color:#fff}.med-bids{display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:5px;color:#b7c2e5;font-size:11px}.med-bids span{white-space:nowrap}.med-details{margin-top:6px;padding-top:5px;border-top:1px solid #3a405c}@media(max-width:620px){.med-primary-grid{grid-template-columns:1fr}.med-head{align-items:flex-start;flex-direction:column;gap:1px}}
+        </style>
+        <div class="med-head"><div class="med-drag" data-role="float-drag-handle" title="拖动浮窗">⠿ <h4>强化停止 / 继续 EV</h4></div><span>${escapeRankingHtml(enhancementDecision.itemName)} · 当前 +${level} · 保护 +${protection} <button class="med-collapse" type="button" data-role="float-toggle" title="收起">−</button></span></div>
+        ${decisionHtml}
+        <div class="med-details">
+          <div class="med-note">已记录（脚本加载后）：${enhancementDecision.actions} 次；成功 ${enhancementDecision.successes} / 失败 ${enhancementDecision.failures} / 跳级 ${enhancementDecision.leaps} / 保护消耗 ${enhancementDecision.protectionUses}（观测成功率 ${observedRate}，不参与 EV 概率计算）</div>
+          <div>白板当前最低卖单：${whiteboardAsk > 0 ? formatDecisionMoney(whiteboardAsk) : "无卖单"}　${stopValue === null || whiteboardAsk <= 0 ? "本次实际停止盈亏无法估值" : `本次实际停止盈亏 ${formatDecisionMoney(actualPnl)}`}</div>
+          <div class="med-note">本次盈亏按当前市场价估值：白板取左一卖单，材料/保护取当前可购买价；不计入未来 EV。</div>
+          ${rates ? `<div>游戏当前概率：成功 ${(rates.success * 100).toFixed(2)}%（普通 ${(rates.normal * 100).toFixed(2)}%，跳级 ${(rates.leap * 100).toFixed(2)}%，失败 ${(rates.failure * 100).toFixed(2)}%）</div>` : ""}
+          ${costModel.error ? `<div class="med-warning">${escapeRankingHtml(costModel.error)}</div>` : `<div class="med-note">单次材料 ${formatDecisionMoney(costModel.materialPerAction)}；保护道具 ${costModel.protectionHrid ? `${escapeRankingHtml(costModel.protectionHrid)} ${formatDecisionMoney(costModel.protectionPrice)}` : "当前保护起点不消耗"}。</div>`}
+          ${futureHtml}
+          <div class="med-note">递归策略：${policySummary}</div>
+          <div class="med-bids">${bidLevels}</div>
+        </div>`;
+    }
+
+    // ═══════════════════════════════════════════════
     //  WebSocket Hook（缓存市场数据）
     // ═══════════════════════════════════════════════
 
@@ -3465,6 +3892,9 @@
               if (msg?.type === "market_item_order_books_updated" && msg.marketItemOrderBooks) {
                 updateMarketCacheFromWS(msg.marketItemOrderBooks);
                 clearAllInserted();
+                ensureEnhancementDecisionPanel();
+              } else if (msg?.type === "action_completed") {
+                handleEnhancementActionCompleted(msg);
               }
             } catch (_) {}
           }
@@ -3487,7 +3917,7 @@
           const target = mutation.target?.nodeType === Node.ELEMENT_NODE
             ? mutation.target
             : mutation.target?.parentElement;
-          return Boolean(target?.closest?.("#enhance-ranking-floating-overlay, #mwi-enhance-toolkit-button, #mwi-enhance-toolkit-menu"));
+          return Boolean(target?.closest?.("#enhance-ranking-floating-overlay, #mwi-enhance-toolkit-button, #mwi-enhance-toolkit-menu, #mwi-enhance-decision-panel"));
         });
         if (onlyRankingUiChanged) return;
         if (debounceTimer) return;
@@ -3497,6 +3927,7 @@
           debounceTimer = null;
           try {
             insertOrderBooksInfo(document);
+            ensureEnhancementDecisionPanel();
           } catch (e) {
             console.error("[HourlyRate]", e);
           }
@@ -3510,13 +3941,14 @@
     // ═══════════════════════════════════════════════
 
     async function init() {
-      console.log("[MWI Enhance Helper] header toolbox ranking v1.9.0 loaded");
+      console.log("[MWI Enhance Helper] header toolbox ranking v1.11.0 loaded");
       injectTooltipStyle();
       document.addEventListener("click", hideTooltip);
       window.addEventListener("scroll", hideTooltip, true);
       window.addEventListener("resize", hideTooltip);
       // 工具箱按钮独立于游戏标签栏，锚定在玩家名字左侧。
       startHeaderToolkitIntegration();
+      ensureEnhancementDecisionPanel();
       window.__MWI_PRIVATE_MARKET_PROMISE__ = window.__MWI_PRIVATE_MARKET_PROMISE__ || fetchMarketApi();
       await window.__MWI_PRIVATE_MARKET_PROMISE__;
       if (!legacyHourlyRateAlreadyRunning) {
