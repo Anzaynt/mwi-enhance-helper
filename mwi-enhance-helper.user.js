@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Milkyway Idle - Enhance Helper
 // @namespace    https://github.com/Anzaynt/mwi-enhance-helper
-// @version      1.11.0
-// @description  Header toolbox with enhancement ranking and a live stop/continue EV helper.
+// @version      1.12.0
+// @description  Header toolbox with multi-route enhancement ranking and a live stop/continue EV helper.
 // @author       Anzaynt
 // @license      MIT
 // @homepageURL   https://github.com/Anzaynt/mwi-enhance-helper
@@ -2392,88 +2392,447 @@
       return { price: 0, source: null };
     }
 
-    function computeEnhanceMetrics(itemHrid, targetLevel, protectLevel, originLevel, buffs, state) {
-      const result = enhancelate(itemHrid, targetLevel, protectLevel, originLevel, -1, buffs, state);
-      if (!result) return null;
-
+    function getEnhancementTiming(itemHrid, buffs, state) {
       const icd = getInitClientData();
       const actionDetail = icd?.actionDetailMap?.[ENHANCE_ACTION_HRID];
-      const baseTimeCostNs = actionDetail?.baseTimeCost || 8e9;
-
       const item = getItemDetail(itemHrid, state);
-      const rawLevel = getSkillLevel(state, ENHANCE_SKILL_HRID);
-      const playerLevel = rawLevel + getBuffOf(buffs, "Level");
-      const itemLevel = item?.itemLevel || 0;
+      if (!item) return null;
 
-      const speedBuff = getBuffOf(buffs, "Speed");
-      const speedFromLevel = Math.max(0, playerLevel - itemLevel) * 0.01;
-      // Keep the time model finite if a malformed/negative buff is received.
-      const totalSpeed = Math.max(0.01, 1 + speedBuff + speedFromLevel);
+      const baseTimeCostNs = actionDetail?.baseTimeCost || 8e9;
+      const playerLevel = getSkillLevel(state, ENHANCE_SKILL_HRID) + getBuffOf(buffs, "Level");
+      const speedFromLevel = Math.max(0, playerLevel - (item.itemLevel || 0)) * 0.01;
+      const totalSpeed = Math.max(0.01, 1 + getBuffOf(buffs, "Speed") + speedFromLevel);
+      const effectiveTimeCostNs = Math.max(baseTimeCostNs / totalSpeed, MIN_TIME_COST_NS);
+      return {
+        actionsPH: NS_PER_HOUR / effectiveTimeCostNs,
+        hoursPerAction: effectiveTimeCostNs / NS_PER_HOUR
+      };
+    }
 
-      const timeCostNs = baseTimeCostNs / totalSpeed;
-      const effectiveTimeCostNs = Math.max(timeCostNs, MIN_TIME_COST_NS);
-      const actionsPH = NS_PER_HOUR / effectiveTimeCostNs;
+    function getEnhancementCostContext(itemHrid, buffs, state) {
+      const item = getItemDetail(itemHrid, state);
+      if (!item) return null;
 
-      const {
-        actions, protects, exp, targetRate, leapRate, escapeRate,
-        varActions, varProtects, covActProt
-      } = result;
-      const successRate = targetRate + leapRate;
-
-      // 检查材料价格是否完整
-      const enhancementCosts = item?.enhancementCosts || [];
       let matCostPerAction = 0;
-      for (const mat of enhancementCosts) {
+      for (const mat of item.enhancementCosts || []) {
         const price = getMarketAskPrice(mat.itemHrid, 0);
-        if (price <= 0) return null; // 材料价格缺失
+        if (price <= 0) return null;
         matCostPerAction += (mat.count || 0) * price;
       }
 
-      // 检查白板价格（选择市场价和制造成本中更低的，制造成本考虑工匠茶）
-      const drinkConcentration = buffs.drinkConcentration || 0;
-      const whitePriceInfo = getWhiteItemPriceWithSource(itemHrid, state, drinkConcentration);
-      if (whitePriceInfo.price <= 0) return null; // 白板价格缺失且无法制造
-      const whitePrice = whitePriceInfo.price;
-      const whiteSource = whitePriceInfo.source;
+      const whitePriceInfo = getWhiteItemPriceWithSource(itemHrid, state, buffs.drinkConcentration || 0);
+      if (whitePriceInfo.price <= 0) return null;
 
-      // 保护材料选择：专属保护材料（或白板本体） + 保护之镜，取最便宜的
-      const MIRROR_HRID = "/items/mirror_of_protection";
+      // 白板本体、专属保护物和保护之镜都可以作为保护材料，按实际可购买价择低。
+      const candidateHrids = new Set([
+        itemHrid,
+        "/items/mirror_of_protection",
+        ...(item.protectionItemHrids || [])
+      ]);
       const protectionCandidates = [];
-      if (item?.protectionItemHrids && item.protectionItemHrids.length > 0) {
-        for (const hrid of item.protectionItemHrids) {
-          const price = getMarketAskPrice(hrid, 0);
-          if (price > 0) protectionCandidates.push({ hrid, price });
-        }
-      } else {
-        const selfPrice = getMarketAskPrice(itemHrid, 0);
-        if (selfPrice > 0) protectionCandidates.push({ hrid: itemHrid, price: selfPrice });
+      for (const hrid of candidateHrids) {
+        const price = getMarketAskPrice(hrid, 0);
+        if (price > 0) protectionCandidates.push({ hrid, price });
       }
-      const mirrorPrice = getMarketAskPrice(MIRROR_HRID, 0);
-      if (mirrorPrice > 0) protectionCandidates.push({ hrid: MIRROR_HRID, price: mirrorPrice });
-
-      // 如果需要保护但没有可用的保护材料价格，返回 null
-      if (protectionCandidates.length === 0) return null;
-
-      const bestProtection = protectionCandidates.reduce((a, b) => a.price < b.price ? a : b);
-      const protectionPrice = bestProtection.price;
-
-      // 消耗 = 材料成本 + 保护材料成本
-      const consumeCost = matCostPerAction * actions + protectionPrice * protects;
-      const totalCostNoHourly = consumeCost + whitePrice;
-
-      const expBuff = getBuffOf(buffs, "Experience");
-      const totalExp = exp * (1 + expBuff);
-      const totalTimeHours = actions / actionsPH;
-      const expPerHour = totalTimeHours > 0 ? totalExp / totalTimeHours : 0;
+      const protection = protectionCandidates.length > 0
+        ? protectionCandidates.reduce((best, candidate) => candidate.price < best.price ? candidate : best)
+        : null;
 
       return {
-        actions, protects, actionsPH, successRate, escapeRate,
-        totalCostNoHourly, totalTimeHours, expPerHour,
-        consumeCost, whitePrice, whiteSource,
-        // 风险调整所需的中间量（材料/保护单价视为确定性市场价）
-        matCostPerAction, protectionPrice,
-        varActions, varProtects, covActProt
+        item,
+        matCostPerAction,
+        whitePrice: whitePriceInfo.price,
+        whiteSource: whitePriceInfo.source,
+        protectionPrice: protection?.price || 0,
+        protectionHrid: protection?.hrid || null
       };
+    }
+
+    function buildEnhanceMetricsFromExpectation(itemHrid, expectation, buffs, state) {
+      if (!expectation || !(expectation.actions >= 0) || !(expectation.protects >= 0)) return null;
+      const timing = getEnhancementTiming(itemHrid, buffs, state);
+      const costs = getEnhancementCostContext(itemHrid, buffs, state);
+      if (!timing || !costs) return null;
+      if (expectation.protects > 1e-9 && !(costs.protectionPrice > 0)) return null;
+
+      const actions = expectation.actions;
+      const protects = expectation.protects;
+      const baseItemCount = Math.max(1, Number(expectation.baseItemCount) || 1);
+      const consumeCost = costs.matCostPerAction * actions + costs.protectionPrice * protects;
+      const totalCostNoHourly = consumeCost + costs.whitePrice * baseItemCount;
+      const totalTimeHours = actions * timing.hoursPerAction;
+      const totalExp = (Number(expectation.exp) || 0) * (1 + getBuffOf(buffs, "Experience"));
+
+      return {
+        routeType: "traditional",
+        actions,
+        protects,
+        actionsPH: timing.actionsPH,
+        successRate: (Number(expectation.targetRate) || 0) + (Number(expectation.leapRate) || 0),
+        escapeRate: Number(expectation.escapeRate) || 0,
+        totalCostNoHourly,
+        totalTimeHours,
+        totalExp,
+        expPerHour: totalTimeHours > 0 ? totalExp / totalTimeHours : 0,
+        consumeCost,
+        whitePrice: costs.whitePrice,
+        whiteSource: costs.whiteSource,
+        baseItemCount,
+        protectionHrid: costs.protectionHrid,
+        // 风险调整所需的中间量（材料/保护单价视为确定性市场价）
+        matCostPerAction: costs.matCostPerAction,
+        protectionPrice: costs.protectionPrice,
+        varActions: Number(expectation.varActions) || 0,
+        varProtects: Number(expectation.varProtects) || 0,
+        covActProt: Number(expectation.covActProt) || 0
+      };
+    }
+
+    function computeEnhanceMetrics(itemHrid, targetLevel, protectLevel, originLevel, buffs, state) {
+      const expectation = enhancelate(itemHrid, targetLevel, protectLevel, originLevel, -1, buffs, state);
+      return buildEnhanceMetricsFromExpectation(itemHrid, expectation, buffs, state);
+    }
+
+    // 贤者之镜的输入必须「恰好」强化到所需等级。福气茶跳过目标等级时，
+    // 该白板作废并重新开始，因此把跨级状态视为一次外部退出后再除以成功概率。
+    function computeExactEnhanceExpectation(itemHrid, targetLevel, protectLevel, buffs, state) {
+      const target = Math.floor(Number(targetLevel));
+      const item = getItemDetail(itemHrid, state);
+      if (!item || !Number.isInteger(target) || target < 0 || target > 20) return null;
+      if (target === 0) {
+        return { actions: 0, protects: 0, exp: 0, baseItemCount: 1, targetRate: 1, leapRate: 0, escapeRate: 0 };
+      }
+
+      const matrix = Array.from({ length: target }, (_, row) =>
+        Array.from({ length: target }, (_, column) => row === column ? 1 : 0)
+      );
+      const targetExit = new Array(target).fill(0);
+      const protectPerAction = new Array(target).fill(0);
+      const expPerAction = new Array(target).fill(0);
+
+      for (let level = 0; level < target; level++) {
+        const rates = getEnhancementTransitionRates(itemHrid, level, buffs, state);
+        if (!rates) return null;
+
+        const addTransition = (destination, probability) => {
+          if (!(probability > 0)) return;
+          if (destination < target) matrix[level][destination] -= probability;
+          else if (destination === target) targetExit[level] += probability;
+          // destination > target is an unusable blessed-tea overshoot.
+        };
+        addTransition(level + 1, rates.normal);
+        addTransition(level + 2, rates.leap);
+        addTransition(level >= protectLevel ? Math.max(0, level - 1) : 0, rates.failure);
+
+        if (level >= protectLevel) protectPerAction[level] = rates.failure;
+        const baseExp = 1.4 * (1 + level) * (10 + (item.itemLevel || 0));
+        expPerAction[level] = (rates.success + 0.1 * (1 - rates.success)) * baseExp;
+      }
+
+      const inverse = invertMatrix(matrix);
+      if (!inverse) return null;
+      const visits = inverse[0];
+      const sum = (values) => visits.reduce((total, visitCount, index) => total + visitCount * values[index], 0);
+      const exactProbability = sum(targetExit);
+      if (!(exactProbability > 1e-12)) return null;
+
+      return {
+        actions: visits.reduce((total, value) => total + value, 0) / exactProbability,
+        protects: sum(protectPerAction) / exactProbability,
+        exp: sum(expPerAction) / exactProbability,
+        baseItemCount: 1 / exactProbability,
+        targetRate: exactProbability,
+        leapRate: 0,
+        escapeRate: 0,
+        varActions: 0,
+        varProtects: 0,
+        covActProt: 0
+      };
+    }
+
+    const PHILOSOPHERS_MIRROR_HRID = "/items/philosophers_mirror";
+    const PHILOSOPHERS_MIRROR_MIN_LEVEL = 13;
+
+    function buildRefinementRecipeIndex() {
+      const recipes = new Map();
+      const actionMap = getInitClientData()?.actionDetailMap || {};
+      for (const [actionHrid, actionDetail] of Object.entries(actionMap)) {
+        const refinedOutputs = (actionDetail?.outputItems || []).filter((output) =>
+          String(output?.itemHrid || "").endsWith("_refined")
+        );
+        const shardInputs = (actionDetail?.inputItems || []).filter((input) =>
+          String(input?.itemHrid || "").endsWith("_refinement_shard") && Number(input.count) > 0
+        );
+        if (refinedOutputs.length === 0 || shardInputs.length === 0) continue;
+        for (const output of refinedOutputs) {
+          const refinedHrid = output.itemHrid;
+          const baseHrid = actionDetail.upgradeItemHrid || refinedHrid.replace(/_refined$/, "");
+          if (!recipes.has(refinedHrid) && baseHrid) {
+            recipes.set(refinedHrid, {
+              actionHrid,
+              actionDetail,
+              baseHrid,
+              refinedHrid,
+              outputCount: Math.max(1, Number(output.count) || 1)
+            });
+          }
+        }
+      }
+      return recipes;
+    }
+
+    function createEnhancementRoutePlanner(buffs, state) {
+      return {
+        buffs,
+        state,
+        traditionalPlans: new Map(),
+        componentPlans: new Map(),
+        refinementRecipes: buildRefinementRecipeIndex(),
+        refinementCosts: new Map(),
+        mirrorUnitCost: undefined
+      };
+    }
+
+    function getRefinementCarryoverCost(planner, recipe) {
+      if (!recipe?.actionDetail?.retainAllEnhancement || recipe.outputCount !== 1) return 0;
+      if (planner.refinementCosts.has(recipe.refinedHrid)) return planner.refinementCosts.get(recipe.refinedHrid);
+
+      const artisanMultiplier = 1 - getArtisanBuff(planner.state, planner.buffs.drinkConcentration || 0);
+      let total = 0;
+      for (const input of recipe.actionDetail.inputItems || []) {
+        const count = Number(input?.count) || 0;
+        const price = getMarketAskPrice(input?.itemHrid, 0);
+        if (!(count > 0) || !(price > 0)) {
+          planner.refinementCosts.set(recipe.refinedHrid, 0);
+          return 0;
+        }
+        total += count * price * artisanMultiplier;
+      }
+      const cost = total > 0 ? total : 0;
+      planner.refinementCosts.set(recipe.refinedHrid, cost);
+      return cost;
+    }
+
+    function getTraditionalRoutePlans(planner, itemHrid, targetLevel, exactLevel = false) {
+      const target = Math.floor(Number(targetLevel));
+      const key = `${itemHrid}:${target}:${exactLevel ? "exact" : "standard"}`;
+      if (planner.traditionalPlans.has(key)) return planner.traditionalPlans.get(key);
+
+      const plans = [];
+      if (target === 0) {
+        const base = buildEnhanceMetricsFromExpectation(itemHrid, {
+          actions: 0, protects: 0, exp: 0, baseItemCount: 1, targetRate: 1, leapRate: 0, escapeRate: 0
+        }, planner.buffs, planner.state);
+        if (base) plans.push({ ...base, protectLevel: null, routeType: "traditional", routeLabel: "传统白板" });
+      } else if (target >= 1 && target <= 20) {
+        for (let protectLevel = 1; protectLevel <= target; protectLevel++) {
+          const metrics = exactLevel
+            ? buildEnhanceMetricsFromExpectation(
+              itemHrid,
+              computeExactEnhanceExpectation(itemHrid, target, protectLevel, planner.buffs, planner.state),
+              planner.buffs,
+              planner.state
+            )
+            : computeEnhanceMetrics(itemHrid, target, protectLevel, 0, planner.buffs, planner.state);
+          if (!metrics) continue;
+          plans.push({
+            ...metrics,
+            protectLevel,
+            routeType: "traditional",
+            routeLabel: `传统 +${protectLevel} 保`
+          });
+        }
+      }
+      planner.traditionalPlans.set(key, plans);
+      return plans;
+    }
+
+    function addRefinementCarryover(plan, refinementCost, refinementLevel) {
+      return {
+        ...plan,
+        routeType: "refinementCarryover",
+        routeLabel: `普通 +${refinementLevel} 后精炼`,
+        refinementAtLevel: refinementLevel,
+        refinementCost,
+        totalCostNoHourly: plan.totalCostNoHourly + refinementCost,
+        consumeCost: plan.consumeCost + refinementCost
+      };
+    }
+
+    function getComponentRoutePlans(planner, itemHrid, targetLevel, exactLevel = false) {
+      const target = Math.floor(Number(targetLevel));
+      const key = `${itemHrid}:${target}:${exactLevel ? "exact" : "standard"}`;
+      if (planner.componentPlans.has(key)) return planner.componentPlans.get(key);
+
+      const plans = [...getTraditionalRoutePlans(planner, itemHrid, target, exactLevel)];
+      if (itemHrid.endsWith("_refined")) {
+        const recipe = planner.refinementRecipes.get(itemHrid);
+        const refinementCost = getRefinementCarryoverCost(planner, recipe);
+        if (recipe && refinementCost > 0) {
+          const basePlans = getTraditionalRoutePlans(planner, recipe.baseHrid, target, exactLevel);
+          for (const plan of basePlans) plans.push(addRefinementCarryover(plan, refinementCost, target));
+        }
+      }
+      planner.componentPlans.set(key, plans);
+      return plans;
+    }
+
+    function getPhilosophersMirrorUnitCost(planner) {
+      if (planner.mirrorUnitCost !== undefined) return planner.mirrorUnitCost;
+      const priceInfo = getWhiteItemPriceWithSource(
+        PHILOSOPHERS_MIRROR_HRID,
+        planner.state,
+        planner.buffs.drinkConcentration || 0
+      );
+      planner.mirrorUnitCost = priceInfo?.price > 0
+        ? { price: priceInfo.price, source: priceInfo.source }
+        : null;
+      return planner.mirrorUnitCost;
+    }
+
+    function buildPhilosophersMirrorTemplate(planner, itemHrid, targetLevel, mirrorOutputMin) {
+      const target = Math.floor(Number(targetLevel));
+      const outputMin = Math.floor(Number(mirrorOutputMin));
+      if (target < outputMin || outputMin < PHILOSOPHERS_MIRROR_MIN_LEVEL) return null;
+
+      const isRefined = itemHrid.endsWith("_refined");
+      const refinementRecipe = isRefined ? planner.refinementRecipes.get(itemHrid) : null;
+      if (isRefined && !refinementRecipe?.baseHrid) return null;
+      const normalHrid = isRefined ? refinementRecipe.baseHrid : itemHrid;
+      const mirror = getPhilosophersMirrorUnitCost(planner);
+      if (!mirror) return null;
+
+      const normalNeeds = Array(21).fill(0);
+      const refinedNeeds = Array(21).fill(0);
+      const normalMirrorByOutput = Array(21).fill(0);
+      const refinedMirrorByOutput = Array(21).fill(0);
+      (isRefined ? refinedNeeds : normalNeeds)[target] = 1;
+
+      for (let level = target; level >= outputMin; level--) {
+        const normalCount = normalNeeds[level];
+        if (normalCount > 0) {
+          normalNeeds[level] = 0;
+          normalNeeds[level - 1] += normalCount;
+          normalNeeds[level - 2] += normalCount;
+          normalMirrorByOutput[level] += normalCount;
+        }
+        const refinedCount = refinedNeeds[level];
+        if (refinedCount > 0) {
+          refinedNeeds[level] = 0;
+          refinedNeeds[level - 1] += refinedCount;
+          normalNeeds[level - 2] += refinedCount;
+          refinedMirrorByOutput[level] += refinedCount;
+        }
+      }
+
+      const components = [];
+      const appendComponents = (componentHrid, needs, kind) => {
+        for (let level = 0; level < outputMin; level++) {
+          const quantity = Number(needs[level]) || 0;
+          if (!(quantity > 0)) continue;
+          const plans = getComponentRoutePlans(planner, componentHrid, level, true);
+          if (plans.length === 0) return false;
+          components.push({ itemHrid: componentHrid, level, quantity, kind, plans });
+        }
+        return true;
+      };
+      if (!appendComponents(normalHrid, normalNeeds, "normal")) return null;
+      if (isRefined && !appendComponents(itemHrid, refinedNeeds, "refined")) return null;
+
+      const mirrorCount = normalMirrorByOutput.reduce((sum, count) => sum + count, 0)
+        + refinedMirrorByOutput.reduce((sum, count) => sum + count, 0);
+      return components.length > 0 && mirrorCount > 0 ? {
+        routeType: "philosophersMirror",
+        routeLabel: `贤者之镜 +${outputMin - 1} 起`,
+        mirrorStartLevel: outputMin - 1,
+        mirrorOutputMin: outputMin,
+        mirrorCount,
+        mirrorUnitCost: mirror.price,
+        mirrorSource: mirror.source,
+        components
+      } : null;
+    }
+
+    function assemblePhilosophersMirrorRoute(template, selectedComponents) {
+      const metrics = {
+        routeType: "philosophersMirror",
+        routeLabel: template.routeLabel,
+        protectLevel: null,
+        protectionHrid: null,
+        mirrorStartLevel: template.mirrorStartLevel,
+        mirrorOutputMin: template.mirrorOutputMin,
+        mirrorCount: template.mirrorCount,
+        mirrorUnitCost: template.mirrorUnitCost,
+        mirrorSource: template.mirrorSource,
+        actions: 0,
+        protects: 0,
+        totalExp: 0,
+        totalTimeHours: 0,
+        baseItemCost: 0,
+        materialCost: 0,
+        protectCost: 0,
+        componentDetails: []
+      };
+      for (const component of selectedComponents) {
+        const { quantity, plan } = component;
+        metrics.actions += plan.actions * quantity;
+        metrics.protects += plan.protects * quantity;
+        metrics.totalExp += plan.totalExp * quantity;
+        metrics.totalTimeHours += plan.totalTimeHours * quantity;
+        metrics.baseItemCost += plan.whitePrice * plan.baseItemCount * quantity;
+        metrics.materialCost += plan.matCostPerAction * plan.actions * quantity;
+        metrics.protectCost += plan.protectionPrice * plan.protects * quantity;
+        metrics.componentDetails.push({
+          itemHrid: component.itemHrid,
+          level: component.level,
+          quantity,
+          routeType: plan.routeType,
+          protectLevel: plan.protectLevel
+        });
+      }
+      metrics.mirrorCost = template.mirrorCount * template.mirrorUnitCost;
+      metrics.consumeCost = metrics.materialCost + metrics.protectCost + metrics.mirrorCost;
+      metrics.totalCostNoHourly = metrics.baseItemCost + metrics.consumeCost;
+      metrics.actionsPH = metrics.totalTimeHours > 0 ? metrics.actions / metrics.totalTimeHours : 0;
+      metrics.expPerHour = metrics.totalTimeHours > 0 ? metrics.totalExp / metrics.totalTimeHours : 0;
+      metrics.whitePrice = metrics.baseItemCost;
+      metrics.whiteSource = "组合路线";
+      metrics.baseItemCount = 0;
+      metrics.matCostPerAction = metrics.actions > 0 ? metrics.materialCost / metrics.actions : 0;
+      metrics.protectionPrice = metrics.protects > 0 ? metrics.protectCost / metrics.protects : 0;
+      metrics.varActions = 0;
+      metrics.varProtects = 0;
+      metrics.covActProt = 0;
+      return metrics;
+    }
+
+    function chooseBestPhilosophersMirrorRoute(template, productPrice) {
+      let expectedHourly = 0;
+      let previousSignature = "";
+      let selectedRoute = null;
+      for (let iteration = 0; iteration < 10; iteration++) {
+        const selectedComponents = template.components.map((component) => {
+          const plan = component.plans.reduce((best, candidate) => {
+            const candidateScore = candidate.totalCostNoHourly + expectedHourly * candidate.totalTimeHours;
+            const bestScore = best.totalCostNoHourly + expectedHourly * best.totalTimeHours;
+            return candidateScore < bestScore - 1e-8
+              || (Math.abs(candidateScore - bestScore) <= 1e-8 && candidate.totalCostNoHourly < best.totalCostNoHourly)
+              ? candidate
+              : best;
+          });
+          return { ...component, plan };
+        });
+        const route = assemblePhilosophersMirrorRoute(template, selectedComponents);
+        const hourly = calcHourlyCost(route, productPrice);
+        const signature = selectedComponents.map((component) =>
+          `${component.itemHrid}:${component.level}:${component.plan.routeType}:${component.plan.protectLevel}`
+        ).join("|");
+        selectedRoute = route;
+        if (signature === previousSignature || Math.abs(hourly - expectedHourly) < 0.01) break;
+        previousSignature = signature;
+        expectedHourly = hourly;
+      }
+      return selectedRoute;
     }
 
     /**
@@ -2483,6 +2842,9 @@
      */
     function calcHourlyCost(metrics, productPrice) {
       const profit = productPrice * SELL_TAX_FACTOR - metrics.totalCostNoHourly;
+      if (Number.isFinite(metrics.totalTimeHours) && metrics.totalTimeHours > 0) {
+        return profit / metrics.totalTimeHours;
+      }
       return profit / metrics.actions * metrics.actionsPH;
     }
 
@@ -2513,23 +2875,31 @@
     /**
      * 遍历所有合理的 protectLevel，返回 hourlyCost 最大的（和 milkonomy 高亮逻辑一致）
      */
-    function computeBestMetrics(itemHrid, targetLevel, buffs, state, productPrice = null) {
+    function computeBestMetrics(itemHrid, targetLevel, buffs, state, productPrice = null, routePlanner = null) {
       if (productPrice === null) {
         productPrice = getMarketAskPrice(itemHrid, targetLevel);
       }
 
-      let best = null;
-      let bestHourlyCost = -Infinity;
-      for (let pl = 1; pl <= targetLevel; pl++) {
-        const d = computeEnhanceMetrics(itemHrid, targetLevel, pl, 0, buffs, state);
-        if (!d) continue;
-        const hourlyCost = calcHourlyCost(d, productPrice);
-        if (hourlyCost > bestHourlyCost) {
-          bestHourlyCost = hourlyCost;
-          best = { ...d, protectLevel: pl };
+      const planner = routePlanner || createEnhancementRoutePlanner(buffs, state);
+      const routes = [...getComponentRoutePlans(planner, itemHrid, targetLevel, false)];
+      if (targetLevel >= PHILOSOPHERS_MIRROR_MIN_LEVEL) {
+        for (let outputMin = PHILOSOPHERS_MIRROR_MIN_LEVEL; outputMin <= targetLevel; outputMin++) {
+          const template = buildPhilosophersMirrorTemplate(planner, itemHrid, targetLevel, outputMin);
+          const route = template ? chooseBestPhilosophersMirrorRoute(template, productPrice) : null;
+          if (route) routes.push(route);
         }
       }
-      return best;
+
+      return routes.reduce((best, route) => {
+        const hourly = calcHourlyCost(route, productPrice);
+        if (!Number.isFinite(hourly)) return best;
+        if (!best) return route;
+        const bestHourly = calcHourlyCost(best, productPrice);
+        return hourly > bestHourly + 1e-8
+          || (Math.abs(hourly - bestHourly) <= 1e-8 && route.totalCostNoHourly < best.totalCostNoHourly)
+          ? route
+          : best;
+      }, null);
     }
 
     // ═══════════════════════════════════════════════
@@ -2665,10 +3035,17 @@
       const profitPerItem = afterTax - metrics.totalCostNoHourly;
       const hourlyCost = calcHourlyCost(metrics, price);
       const profitClass = profitPerItem >= 0 ? "tt-profit-pos" : "tt-profit-neg";
-      let html = `<div class="tt-header">0→+${enhancementLevel} (保护+${metrics.protectLevel})</div>`
+      const routeLabel = metrics.routeLabel || `传统 +${metrics.protectLevel} 保`;
+      const routeExtra = metrics.routeType === "philosophersMirror"
+        ? `<span class="tt-label">贤者之镜:</span> <span class="tt-value">${metrics.mirrorCount.toFixed(0)} 个（${metrics.mirrorSource || "当前最低取得成本"}）</span>\n`
+        : metrics.routeType === "refinementCarryover"
+          ? `<span class="tt-label">精炼成本:</span> <span class="tt-value">${formatMoney(metrics.refinementCost)}</span>\n`
+          : "";
+      let html = `<div class="tt-header">0→+${enhancementLevel} (${routeLabel})</div>`
         + `<span class="tt-label">挂单价:</span> <span class="tt-value">${formatMoney(price)}</span>\n`
         + `<span class="tt-label">税后:</span> <span class="tt-value">${formatMoney(afterTax)}</span>\n`
         + `<span class="tt-label">白板(${metrics.whiteSource}):</span> <span class="tt-value">${formatMoney(metrics.whitePrice)}</span>\n`
+        + routeExtra
         + `<span class="tt-label">强化消耗:</span> <span class="tt-value">${formatMoney(metrics.consumeCost)}</span>\n`
         + `<span class="tt-label">总成本:</span> <span class="tt-value">${formatMoney(metrics.totalCostNoHourly)}</span>\n`
         + `<span class="tt-label">单件利润:</span> <span class="${profitClass}">${formatMoney(profitPerItem)}</span>\n`
@@ -3052,7 +3429,7 @@
           <div class="ehr-table-wrap">
             <table>
               <thead><tr>
-                <th>#</th><th>物品</th><th>目标</th><th>最高收购价</th><th>工时费/h</th><th>风控工时费/h</th><th>经验/h</th><th>保护起点</th><th>预计成本</th><th>预计耗时</th>
+                <th>#</th><th>物品</th><th>目标</th><th>最高收购价</th><th>工时费/h</th><th>风控工时费/h</th><th>经验/h</th><th>路线 / 保护</th><th>预计成本</th><th>预计耗时</th>
               </tr></thead>
               <tbody data-role="ranking-body"></tbody>
             </table>
@@ -3108,7 +3485,7 @@
           <td class="${rankingValueClass(row.hourly)}">${formatMoney(row.hourly)}</td>
           <td class="${rankingValueClass(row.riskHourly)}">${Number.isFinite(row.riskHourly) ? formatMoney(row.riskHourly) : "N/A"}</td>
           <td>${formatExp(row.expPerHour)}</td>
-          <td>+${row.protectLevel}</td>
+          <td>${escapeRankingHtml(row.routeLabel || `传统 +${row.protectLevel} 保`)}</td>
           <td>${formatMoney(row.totalCost)}</td>
           <td>${formatRankingHours(row.totalTimeHours)}</td>
         </tr>`).join("");
@@ -3186,6 +3563,7 @@
       const calculationStartedAt = performance.now();
       refreshButton.disabled = true;
       const totalAsset = getCurrentAssetsFromMWITools();
+      const routePlanner = createEnhancementRoutePlanner(buffs, state);
       status.textContent = `准备本地计算 ${jobs.length} 个项目…`;
 
       try {
@@ -3197,10 +3575,12 @@
         for (let index = 0; index < jobs.length; index++) {
           if (token !== rankingUi.calculationToken || !panel.isConnected) return;
           const job = jobs[index];
-          const metrics = computeBestMetrics(job.itemHrid, job.targetLevel, buffs, state, job.bidPrice);
+          const metrics = computeBestMetrics(job.itemHrid, job.targetLevel, buffs, state, job.bidPrice, routePlanner);
           if (metrics) {
             const hourly = calcHourlyCost(metrics, job.bidPrice);
-            const riskHourly = calcRiskAdjustedHourlyCost(metrics, job.bidPrice, totalAsset);
+            const riskHourly = metrics.routeType === "traditional"
+              ? calcRiskAdjustedHourlyCost(metrics, job.bidPrice, totalAsset)
+              : null;
             if (Number.isFinite(hourly) && Number.isFinite(metrics.expPerHour)) {
               rankingUi.rows.push({
                 itemHrid: job.itemHrid,
@@ -3214,6 +3594,7 @@
                 riskHourly: Number.isFinite(riskHourly) ? riskHourly : null,
                 expPerHour: metrics.expPerHour,
                 protectLevel: metrics.protectLevel,
+                routeLabel: metrics.routeLabel,
                 totalCost: metrics.totalCostNoHourly,
                 totalTimeHours: metrics.totalTimeHours
               });
