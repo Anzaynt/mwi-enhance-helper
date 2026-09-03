@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Milkyway Idle - Enhance Helper
 // @namespace    https://github.com/Anzaynt/mwi-enhance-helper
-// @version      1.12.2
-// @description  Header toolbox with market-linked multi-route enhancement ranking and a live stop/continue EV helper.
+// @version      1.13.1
+// @description  Header enhancement boards with market-linked multi-route ranking and a live stop/continue EV helper.
 // @author       Anzaynt
 // @license      MIT
 // @homepageURL   https://github.com/Anzaynt/mwi-enhance-helper
@@ -2463,6 +2463,20 @@
       const totalCostNoHourly = consumeCost + costs.whitePrice * baseItemCount;
       const totalTimeHours = actions * timing.hoursPerAction;
       const totalExp = (Number(expectation.exp) || 0) * (1 + getBuffOf(buffs, "Experience"));
+      const varActions = Math.max(0, Number(expectation.varActions) || 0);
+      const varProtects = Math.max(0, Number(expectation.varProtects) || 0);
+      const varBaseItemCount = Math.max(0, Number(expectation.varBaseItemCount) || 0);
+      const covActProt = Number(expectation.covActProt) || 0;
+      const covActBaseItem = Number(expectation.covActBaseItem) || 0;
+      const covProtectBaseItem = Number(expectation.covProtectBaseItem) || 0;
+      const costVariance = Math.max(0,
+        costs.matCostPerAction * costs.matCostPerAction * varActions
+        + costs.protectionPrice * costs.protectionPrice * varProtects
+        + costs.whitePrice * costs.whitePrice * varBaseItemCount
+        + 2 * costs.matCostPerAction * costs.protectionPrice * covActProt
+        + 2 * costs.matCostPerAction * costs.whitePrice * covActBaseItem
+        + 2 * costs.protectionPrice * costs.whitePrice * covProtectBaseItem
+      );
 
       return {
         routeType: "traditional",
@@ -2480,12 +2494,16 @@
         whiteSource: costs.whiteSource,
         baseItemCount,
         protectionHrid: costs.protectionHrid,
-        // 风险调整所需的中间量（材料/保护单价视为确定性市场价）
+        // 风险调整所需的中间量（单价视为确定性市场价，数量可能随机）
         matCostPerAction: costs.matCostPerAction,
         protectionPrice: costs.protectionPrice,
-        varActions: Number(expectation.varActions) || 0,
-        varProtects: Number(expectation.varProtects) || 0,
-        covActProt: Number(expectation.covActProt) || 0
+        varActions,
+        varProtects,
+        varBaseItemCount,
+        covActProt,
+        covActBaseItem,
+        covProtectBaseItem,
+        costVariance
       };
     }
 
@@ -2495,13 +2513,18 @@
     }
 
     // 贤者之镜的输入必须「恰好」强化到所需等级。福气茶跳过目标等级时，
-    // 该白板作废并重新开始，因此把跨级状态视为一次外部退出后再除以成功概率。
+    // 该白板作废并从 +0 重新开始；矩阵把这次重开也纳入期望和方差。
     function computeExactEnhanceExpectation(itemHrid, targetLevel, protectLevel, buffs, state) {
       const target = Math.floor(Number(targetLevel));
       const item = getItemDetail(itemHrid, state);
       if (!item || !Number.isInteger(target) || target < 0 || target > 20) return null;
       if (target === 0) {
-        return { actions: 0, protects: 0, exp: 0, baseItemCount: 1, targetRate: 1, leapRate: 0, escapeRate: 0 };
+        return {
+          actions: 0, protects: 0, exp: 0, baseItemCount: 1,
+          targetRate: 1, leapRate: 0, escapeRate: 0,
+          varActions: 0, varProtects: 0, varBaseItemCount: 0,
+          covActProt: 0, covActBaseItem: 0, covProtectBaseItem: 0
+        };
       }
 
       const matrix = Array.from({ length: target }, (_, row) =>
@@ -2509,6 +2532,8 @@
       );
       const targetExit = new Array(target).fill(0);
       const protectPerAction = new Array(target).fill(0);
+      const resetPerAction = new Array(target).fill(0);
+      const protectDestination = new Array(target).fill(-1);
       const expPerAction = new Array(target).fill(0);
 
       for (let level = 0; level < target; level++) {
@@ -2519,35 +2544,85 @@
           if (!(probability > 0)) return;
           if (destination < target) matrix[level][destination] -= probability;
           else if (destination === target) targetExit[level] += probability;
-          // destination > target is an unusable blessed-tea overshoot.
+          else {
+            // 跨过精确目标会丢弃这件白板，并以一件新的 +0 重新开始。
+            matrix[level][0] -= probability;
+            resetPerAction[level] += probability;
+          }
         };
         addTransition(level + 1, rates.normal);
         addTransition(level + 2, rates.leap);
-        addTransition(level >= protectLevel ? Math.max(0, level - 1) : 0, rates.failure);
+        const failureDestination = level >= protectLevel ? Math.max(0, level - 1) : 0;
+        addTransition(failureDestination, rates.failure);
 
-        if (level >= protectLevel) protectPerAction[level] = rates.failure;
+        if (level >= protectLevel) {
+          protectPerAction[level] = rates.failure;
+          protectDestination[level] = failureDestination;
+        }
         const baseExp = 1.4 * (1 + level) * (10 + (item.itemLevel || 0));
         expPerAction[level] = (rates.success + 0.1 * (1 - rates.success)) * baseExp;
       }
 
+      if (!targetExit.some((probability) => probability > 0)) return null;
       const inverse = invertMatrix(matrix);
       if (!inverse) return null;
       const visits = inverse[0];
       const sum = (values) => visits.reduce((total, visitCount, index) => total + visitCount * values[index], 0);
-      const exactProbability = sum(targetExit);
-      if (!(exactProbability > 1e-12)) return null;
+      const actions = sum(new Array(target).fill(1));
+      const protects = sum(protectPerAction);
+      const resets = sum(resetPerAction);
+      const exp = sum(expPerAction);
+      if (!Number.isFinite(actions) || actions < 0) return null;
+
+      // 解析计算动作、保护与“重开白板”数量的方差/协方差。
+      // 贤者之镜本身必成；这里的风险只来自制造其精确前置件。
+      const allActions = matVecMul(inverse, new Array(target).fill(1));
+      const allProtects = matVecMul(inverse, protectPerAction);
+      const allResets = matVecMul(inverse, resetPerAction);
+      const valueAt = (values, index) => index >= 0 ? values[index] : 0;
+      const h2 = matVecMul(inverse, allActions.map((value) => 2 * value - 1));
+      const protectSecondRhs = new Array(target).fill(0);
+      const resetSecondRhs = new Array(target).fill(0);
+      const actionProtectRhs = new Array(target).fill(0);
+      const actionResetRhs = new Array(target).fill(0);
+      const protectResetRhs = new Array(target).fill(0);
+      for (let level = 0; level < target; level++) {
+        const protectionProbability = protectPerAction[level];
+        const resetProbability = resetPerAction[level];
+        const protectionTarget = protectDestination[level];
+        protectSecondRhs[level] = protectionProbability * (1 + 2 * valueAt(allProtects, protectionTarget));
+        resetSecondRhs[level] = resetProbability * (1 + 2 * allResets[0]);
+        actionProtectRhs[level] = allProtects[level] + protectionProbability * valueAt(allActions, protectionTarget);
+        actionResetRhs[level] = allResets[level] + resetProbability * allActions[0];
+        protectResetRhs[level] = protectionProbability * valueAt(allResets, protectionTarget)
+          + resetProbability * allProtects[0];
+      }
+      const protectsSquared = matVecMul(inverse, protectSecondRhs);
+      const resetsSquared = matVecMul(inverse, resetSecondRhs);
+      const actionProtect = matVecMul(inverse, actionProtectRhs);
+      const actionReset = matVecMul(inverse, actionResetRhs);
+      const protectReset = matVecMul(inverse, protectResetRhs);
+      const varActions = Math.max(0, h2[0] - actions * actions);
+      const varProtects = Math.max(0, protectsSquared[0] - protects * protects);
+      const varBaseItemCount = Math.max(0, resetsSquared[0] - resets * resets);
+      const covActProt = actionProtect[0] - actions * protects;
+      const covActBaseItem = actionReset[0] - actions * resets;
+      const covProtectBaseItem = protectReset[0] - protects * resets;
 
       return {
-        actions: visits.reduce((total, value) => total + value, 0) / exactProbability,
-        protects: sum(protectPerAction) / exactProbability,
-        exp: sum(expPerAction) / exactProbability,
-        baseItemCount: 1 / exactProbability,
-        targetRate: exactProbability,
+        actions,
+        protects,
+        exp,
+        baseItemCount: 1 + resets,
+        targetRate: 1,
         leapRate: 0,
         escapeRate: 0,
-        varActions: 0,
-        varProtects: 0,
-        covActProt: 0
+        varActions,
+        varProtects,
+        varBaseItemCount,
+        covActProt,
+        covActBaseItem,
+        covProtectBaseItem
       };
     }
 
@@ -2742,6 +2817,23 @@
 
       const mirrorCount = normalMirrorByOutput.reduce((sum, count) => sum + count, 0)
         + refinedMirrorByOutput.reduce((sum, count) => sum + count, 0);
+      const mirrorSteps = [];
+      for (let outputLevel = outputMin; outputLevel <= target; outputLevel++) {
+        if (normalMirrorByOutput[outputLevel] > 0) {
+          mirrorSteps.push({
+            itemHrid: normalHrid,
+            primaryLevel: outputLevel - 1,
+            quantity: normalMirrorByOutput[outputLevel]
+          });
+        }
+        if (refinedMirrorByOutput[outputLevel] > 0) {
+          mirrorSteps.push({
+            itemHrid,
+            primaryLevel: outputLevel - 1,
+            quantity: refinedMirrorByOutput[outputLevel]
+          });
+        }
+      }
       return components.length > 0 && mirrorCount > 0 ? {
         routeType: "philosophersMirror",
         routeLabel: `贤者之镜 +${outputMin - 1} 起`,
@@ -2750,11 +2842,12 @@
         mirrorCount,
         mirrorUnitCost: mirror.price,
         mirrorSource: mirror.source,
+        mirrorSteps,
         components
       } : null;
     }
 
-    function assemblePhilosophersMirrorRoute(template, selectedComponents) {
+    function assemblePhilosophersMirrorRoute(template, selectedComponents, planner) {
       const metrics = {
         routeType: "philosophersMirror",
         routeLabel: template.routeLabel,
@@ -2772,6 +2865,7 @@
         baseItemCost: 0,
         materialCost: 0,
         protectCost: 0,
+        costVariance: 0,
         componentDetails: []
       };
       for (const component of selectedComponents) {
@@ -2783,6 +2877,7 @@
         metrics.baseItemCost += plan.whitePrice * plan.baseItemCount * quantity;
         metrics.materialCost += plan.matCostPerAction * plan.actions * quantity;
         metrics.protectCost += plan.protectionPrice * plan.protects * quantity;
+        metrics.costVariance += (Number(plan.costVariance) || 0) * quantity;
         metrics.componentDetails.push({
           itemHrid: component.itemHrid,
           level: component.level,
@@ -2790,6 +2885,18 @@
           routeType: plan.routeType,
           protectLevel: plan.protectLevel
         });
+      }
+      const experienceMultiplier = 1 + getBuffOf(planner.buffs, "Experience");
+      for (const step of template.mirrorSteps) {
+        const timing = getEnhancementTiming(step.itemHrid, planner.buffs, planner.state);
+        const item = getItemDetail(step.itemHrid, planner.state);
+        if (!timing || !item) return null;
+        const quantity = Number(step.quantity) || 0;
+        const baseExp = 1.4 * (1 + step.primaryLevel) * (10 + (item.itemLevel || 0));
+        // 贤者之镜取代普通强化材料，消耗前置装备并保证本次动作成功。
+        metrics.actions += quantity;
+        metrics.totalTimeHours += quantity * timing.hoursPerAction;
+        metrics.totalExp += quantity * baseExp * experienceMultiplier;
       }
       metrics.mirrorCost = template.mirrorCount * template.mirrorUnitCost;
       metrics.consumeCost = metrics.materialCost + metrics.protectCost + metrics.mirrorCost;
@@ -2801,13 +2908,16 @@
       metrics.baseItemCount = 0;
       metrics.matCostPerAction = metrics.actions > 0 ? metrics.materialCost / metrics.actions : 0;
       metrics.protectionPrice = metrics.protects > 0 ? metrics.protectCost / metrics.protects : 0;
-      metrics.varActions = 0;
-      metrics.varProtects = 0;
-      metrics.covActProt = 0;
+      const componentSummary = metrics.componentDetails.map((component) => {
+        const itemName = PRIVATE_ZH_ITEM_HRIDS[component.itemHrid]
+          || component.itemHrid.split("/").pop().replaceAll("_", " ");
+        return `${itemName} +${component.level}×${component.quantity}`;
+      }).join("、");
+      metrics.routeDetail = `前置：${componentSummary}；贤者之镜×${template.mirrorCount}（镜子阶段必成）`;
       return metrics;
     }
 
-    function chooseBestPhilosophersMirrorRoute(template, productPrice) {
+    function chooseBestPhilosophersMirrorRoute(template, productPrice, planner) {
       let expectedHourly = 0;
       let previousSignature = "";
       let selectedRoute = null;
@@ -2823,7 +2933,8 @@
           });
           return { ...component, plan };
         });
-        const route = assemblePhilosophersMirrorRoute(template, selectedComponents);
+        const route = assemblePhilosophersMirrorRoute(template, selectedComponents, planner);
+        if (!route) return null;
         const hourly = calcHourlyCost(route, productPrice);
         const signature = selectedComponents.map((component) =>
           `${component.itemHrid}:${component.level}:${component.plan.routeType}:${component.plan.protectLevel}`
@@ -2862,9 +2973,12 @@
 
       const cm = metrics.matCostPerAction || 0;
       const cp = metrics.protectionPrice || 0;
-      const varProj = cm * cm * (metrics.varActions || 0)
+      const calculatedVariance = cm * cm * (metrics.varActions || 0)
         + cp * cp * (metrics.varProtects || 0)
         + 2 * cm * cp * (metrics.covActProt || 0);
+      const varProj = Number.isFinite(metrics.costVariance)
+        ? metrics.costVariance
+        : calculatedVariance;
       if (!Number.isFinite(varProj) || varProj < 0) return hourly;
 
       const projectsPerHour = metrics.actions > 0 ? metrics.actionsPH / metrics.actions : 0;
@@ -2886,7 +3000,7 @@
       if (targetLevel >= PHILOSOPHERS_MIRROR_MIN_LEVEL) {
         for (let outputMin = PHILOSOPHERS_MIRROR_MIN_LEVEL; outputMin <= targetLevel; outputMin++) {
           const template = buildPhilosophersMirrorTemplate(planner, itemHrid, targetLevel, outputMin);
-          const route = template ? chooseBestPhilosophersMirrorRoute(template, productPrice) : null;
+          const route = template ? chooseBestPhilosophersMirrorRoute(template, productPrice, planner) : null;
           if (route) routes.push(route);
         }
       }
@@ -3351,7 +3465,7 @@
     }
 
     // ═══════════════════════════════════════════════
-    //  私人功能：玩家名字左侧的“工具箱”入口与强化榜弹窗
+    //  私人功能：玩家名字左侧的“强化榜”入口与榜单弹窗
     //  只读取已缓存的公开市场快照与本地游戏状态。
     //  不调用游戏 API、不发送 WebSocket 消息、不逐物品请求订单簿。
     // ═══════════════════════════════════════════════
@@ -3363,6 +3477,7 @@
       overlay: null,
       dialog: null,
       panel: null,
+      mode: "bid",
       rows: [],
       calculating: false,
       calculationToken: 0,
@@ -3370,6 +3485,39 @@
       marketNavigationBusy: false,
       integrationTimer: null
     };
+
+    function getRankingModeConfig(mode = rankingUi.mode) {
+      if (mode === "ask") {
+        return {
+          mode: "ask",
+          modalTitle: "挂单榜",
+          panelTitle: "强化挂单榜",
+          productPriceLabel: "最低挂单价",
+          validProjectLabel: "有效挂单项目",
+          emptyStatus: "公开市场快照尚未加载，或没有有效的强化最低挂单价。",
+          note: "仅使用当前市场缓存中的最低挂单价（Ask）作为成品出售价，按税后 95% 收入计算；材料和保护道具仍按现有市场成本逻辑。点击物品可跳转对应 +N 市场，并只更新该条目的行情与结果。",
+          quoteKey: "a"
+        };
+      }
+      return {
+        mode: "bid",
+        modalTitle: "填单榜",
+        panelTitle: "强化填单榜",
+        productPriceLabel: "最高收购价",
+        validProjectLabel: "有效填单项目",
+        emptyStatus: "公开市场快照尚未加载，或没有有效的强化最高收购价。",
+        note: "仅使用当前市场缓存中的最高收购价（Bid）作为成品出售价，按税后 95% 收入计算。点击物品可跳转对应 +N 市场，并只更新该条目的行情与结果。",
+        quoteKey: "b"
+      };
+    }
+
+    function applyRankingModePresentation(panel) {
+      if (!panel) return;
+      const config = getRankingModeConfig();
+      panel.querySelector('[data-role="ranking-title"]').textContent = config.panelTitle;
+      panel.querySelector('[data-role="ranking-note"]').textContent = config.note;
+      panel.querySelector('[data-role="ranking-product-price-label"]').textContent = config.productPriceLabel;
+    }
 
     function escapeRankingHtml(value) {
       return String(value ?? "")
@@ -3536,11 +3684,13 @@
           #enhance-hourly-ranking-panel .ehr-positive{color:#7be0bc}
           #enhance-hourly-ranking-panel .ehr-negative{color:#ff7b82}
           #enhance-hourly-ranking-panel .ehr-muted{color:#888ca7}
+          #enhance-hourly-ranking-panel .ehr-route{min-width:190px;white-space:normal;text-align:left;line-height:1.35}
+          #enhance-hourly-ranking-panel .ehr-route-detail{display:block;margin-top:2px;color:#aeb1ca;font-size:10px}
           @media (max-width:900px){#enhance-hourly-ranking-panel .ehr-controls{grid-template-columns:1fr 1fr}#enhance-hourly-ranking-panel .ehr-controls button{grid-column:span 2}}
         </style>
         <div class="ehr-wrap">
-          <div class="ehr-title"><h3>强化收购价排行榜</h3><span>0 → 目标等级</span></div>
-          <p class="ehr-note">仅使用当前市场缓存中的最高收购价（Bid），按税后 95% 收入计算。点击物品可跳转对应 +N 市场，并只更新该条目的行情与结果。</p>
+          <div class="ehr-title"><h3 data-role="ranking-title"></h3><span>0 → 目标等级</span></div>
+          <p class="ehr-note" data-role="ranking-note"></p>
           <div class="ehr-controls">
             <input data-role="ranking-search" type="search" placeholder="筛选物品名称 / HRID">
             <select data-role="ranking-sort" title="排序指标">
@@ -3560,7 +3710,7 @@
           <div class="ehr-table-wrap">
             <table>
               <thead><tr>
-                <th>#</th><th>物品</th><th>目标</th><th>最高收购价</th><th>工时费/h</th><th>风控工时费/h</th><th>经验/h</th><th>路线 / 保护</th><th>预计成本</th><th>预计耗时</th>
+                <th>#</th><th>物品</th><th>目标</th><th data-role="ranking-product-price-label"></th><th>工时费/h</th><th>风控工时费/h</th><th>经验/h</th><th>路线 / 前置</th><th>预计成本</th><th>预计耗时</th>
               </tr></thead>
               <tbody data-role="ranking-body"></tbody>
             </table>
@@ -3577,6 +3727,7 @@
         event.preventDefault();
         navigateToRankingMarket(panel, link.dataset.itemHrid, Number(link.dataset.targetLevel));
       });
+      applyRankingModePresentation(panel);
       return panel;
     }
 
@@ -3594,6 +3745,7 @@
 
     function renderRankingRows(panel) {
       if (!panel || !panel.isConnected) return;
+      const config = getRankingModeConfig();
       const body = panel.querySelector('[data-role="ranking-body"]');
       const status = panel.querySelector('[data-role="ranking-status"]');
       const sortKey = panel.querySelector('[data-role="ranking-sort"]').value;
@@ -3608,7 +3760,7 @@
       rows.sort((a, b) => {
         const av = Number.isFinite(a[valueKey]) ? a[valueKey] : -Infinity;
         const bv = Number.isFinite(b[valueKey]) ? b[valueKey] : -Infinity;
-        return bv - av || b.bidPrice - a.bidPrice;
+        return bv - av || b.productPrice - a.productPrice;
       });
       const totalMatched = rows.length;
       if (limit > 0) rows = rows.slice(0, limit);
@@ -3618,11 +3770,11 @@
           <td>${index + 1}</td>
           <td><button class="ehr-market-link" type="button" data-role="ranking-market-link" data-item-hrid="${escapeRankingHtml(row.itemHrid)}" data-target-level="${row.targetLevel}" title="前往 +${row.targetLevel} 市场并刷新本条结果">${escapeRankingHtml(row.itemName)}</button></td>
           <td>+${row.targetLevel}</td>
-          <td>${formatMoney(row.bidPrice)}</td>
+          <td>${formatMoney(row.productPrice)}</td>
           <td class="${rankingValueClass(row.hourly)}">${formatMoney(row.hourly)}</td>
           <td class="${rankingValueClass(row.riskHourly)}">${Number.isFinite(row.riskHourly) ? formatMoney(row.riskHourly) : "N/A"}</td>
           <td>${formatExp(row.expPerHour)}</td>
-          <td>${escapeRankingHtml(row.routeLabel || `传统 +${row.protectLevel} 保`)}</td>
+          <td class="ehr-route" title="${escapeRankingHtml(row.routeDetail || row.routeLabel || "")}"><span>${escapeRankingHtml(row.routeLabel || `传统 +${row.protectLevel} 保`)}</span>${row.routeDetail ? `<span class="ehr-route-detail">${escapeRankingHtml(row.routeDetail)}</span>` : ""}</td>
           <td>${formatMoney(row.totalCost)}</td>
           <td>${formatRankingHours(row.totalTimeHours)}</td>
         </tr>`).join("");
@@ -3634,12 +3786,13 @@
         const timingNote = Number.isFinite(rankingUi.lastCalculationMs)
           ? `；本次计算 ${(rankingUi.lastCalculationMs / 1000).toFixed(1)} 秒`
           : "";
-        status.textContent = `共 ${rankingUi.rows.length} 个有效收购项目，当前显示 ${rows.length} 个${riskNote}${timingNote}`;
+        status.textContent = `共 ${rankingUi.rows.length} 个${config.validProjectLabel}，当前显示 ${rows.length} 个${riskNote}${timingNote}`;
       }
     }
 
-    function getRankingJobs(state) {
+    function getRankingJobs(state, mode = rankingUi.mode) {
       const market = getMarketCache();
+      const config = getRankingModeConfig(mode);
       const jobs = [];
       for (const [itemHrid, levels] of Object.entries(market || {})) {
         const item = getItemDetail(itemHrid, state);
@@ -3655,20 +3808,18 @@
 
         for (const [levelText, quote] of Object.entries(levels)) {
           const targetLevel = Number(levelText);
-          const bidPrice = Number(quote?.b);
+          const productPrice = Number(quote?.[config.quoteKey]);
           if (!Number.isInteger(targetLevel) || targetLevel < 1 || targetLevel > 20) continue;
-          if (!Number.isFinite(bidPrice) || bidPrice <= 0) continue;
-          jobs.push({ itemHrid, targetLevel, bidPrice, item });
+          if (!Number.isFinite(productPrice) || productPrice <= 0) continue;
+          jobs.push({ itemHrid, targetLevel, productPrice, item });
         }
       }
       return jobs;
     }
 
     function createRankingRow(job, metrics, totalAsset) {
-      const hourly = calcHourlyCost(metrics, job.bidPrice);
-      const riskHourly = metrics.routeType === "traditional"
-        ? calcRiskAdjustedHourlyCost(metrics, job.bidPrice, totalAsset)
-        : null;
+      const hourly = calcHourlyCost(metrics, job.productPrice);
+      const riskHourly = calcRiskAdjustedHourlyCost(metrics, job.productPrice, totalAsset);
       if (!Number.isFinite(hourly) || !Number.isFinite(metrics.expPerHour)) return null;
       return {
         itemHrid: job.itemHrid,
@@ -3677,12 +3828,13 @@
           || job.item?.name
           || job.itemHrid.split("/").pop().replaceAll("_", " "),
         targetLevel: job.targetLevel,
-        bidPrice: job.bidPrice,
+        productPrice: job.productPrice,
         hourly,
         riskHourly: Number.isFinite(riskHourly) ? riskHourly : null,
         expPerHour: metrics.expPerHour,
         protectLevel: metrics.protectLevel,
         routeLabel: metrics.routeLabel,
+        routeDetail: metrics.routeDetail || "",
         totalCost: metrics.totalCostNoHourly,
         totalTimeHours: metrics.totalTimeHours
       };
@@ -3697,12 +3849,15 @@
       const state = getGameState();
       const buffs = state ? computeEnhancingBuffs(state) : null;
       const item = state ? getItemDetail(itemHrid, state) : null;
-      const bidPrice = getMarketBidPrice(itemHrid, targetLevel);
+      const config = getRankingModeConfig();
+      const productPrice = config.mode === "ask"
+        ? getMarketAskPrice(itemHrid, targetLevel)
+        : getMarketBidPrice(itemHrid, targetLevel);
       let replacement = null;
-      if (buffs && item && bidPrice > 0) {
-        const job = { itemHrid, targetLevel, bidPrice, item };
+      if (buffs && item && productPrice > 0) {
+        const job = { itemHrid, targetLevel, productPrice, item };
         const planner = createEnhancementRoutePlanner(buffs, state);
-        const metrics = computeBestMetrics(itemHrid, targetLevel, buffs, state, bidPrice, planner);
+        const metrics = computeBestMetrics(itemHrid, targetLevel, buffs, state, productPrice, planner);
         if (metrics) replacement = createRankingRow(job, metrics, getCurrentAssetsFromMWITools());
       }
       if (replacement) rankingUi.rows.splice(rowIndex, 1, replacement);
@@ -3723,6 +3878,7 @@
 
       const refreshButton = panel.querySelector('[data-role="ranking-refresh"]');
       const status = panel.querySelector('[data-role="ranking-status"]');
+      const config = getRankingModeConfig();
       const state = getGameState();
       if (!state) {
         status.textContent = "无法读取游戏状态。请刷新游戏后重试。";
@@ -3733,9 +3889,9 @@
         status.textContent = "无法读取游戏基础数据。请等待游戏加载完成后重试。";
         return;
       }
-      const jobs = getRankingJobs(state);
+      const jobs = getRankingJobs(state, config.mode);
       if (jobs.length === 0) {
-        status.textContent = "公开市场快照尚未加载，或没有有效的强化收购报价。";
+        status.textContent = config.emptyStatus;
         return;
       }
 
@@ -3758,7 +3914,7 @@
         for (let index = 0; index < jobs.length; index++) {
           if (token !== rankingUi.calculationToken || !panel.isConnected) return;
           const job = jobs[index];
-          const metrics = computeBestMetrics(job.itemHrid, job.targetLevel, buffs, state, job.bidPrice, routePlanner);
+          const metrics = computeBestMetrics(job.itemHrid, job.targetLevel, buffs, state, job.productPrice, routePlanner);
           if (metrics) {
             const row = createRankingRow(job, metrics, totalAsset);
             if (row) rankingUi.rows.push(row);
@@ -3864,21 +4020,25 @@
       menu.id = "mwi-enhance-toolkit-menu";
       menu.setAttribute("role", "menu");
       menu.innerHTML = `
-        <div class="met-title">工具箱</div>
-        <button class="met-action" type="button" role="menuitem">强化榜</button>`;
+        <div class="met-title">强化榜</div>
+        <button class="met-action" type="button" role="menuitem" data-ranking-mode="bid">填单榜</button>
+        <button class="met-action" type="button" role="menuitem" data-ranking-mode="ask">挂单榜</button>`;
       menu.style.cssText = "position:fixed;z-index:2147483644;display:flex;min-width:132px;flex-direction:column;gap:4px;padding:7px;border:1px solid #555a7a;border-radius:5px;background:#27283b;box-shadow:0 6px 20px rgba(0,0,0,.45);color:#e7e7e7;font:13px/1.2 Roboto,Helvetica,Arial,sans-serif;";
       const title = menu.querySelector(".met-title");
       title.style.cssText = "padding:4px 7px 7px;border-bottom:1px solid #3b3d60;text-align:center;font-weight:700;";
-      const action = menu.querySelector(".met-action");
-      action.style.cssText = "min-height:30px;padding:4px 9px;border:1px solid #454771;border-radius:4px;background:#2c2e45;color:#e7e7e7;font:inherit;text-align:left;cursor:pointer;";
-      action.addEventListener("mouseenter", () => { action.style.background = "#323450"; });
-      action.addEventListener("mouseleave", () => { action.style.background = "#2c2e45"; });
-      action.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        closeToolkitMenu();
-        openRankingModal();
-      });
+      const actions = menu.querySelectorAll(".met-action");
+      for (const action of actions) {
+        action.style.cssText = "min-height:30px;padding:4px 9px;border:1px solid #454771;border-radius:4px;background:#2c2e45;color:#e7e7e7;font:inherit;text-align:left;cursor:pointer;";
+        action.addEventListener("mouseenter", () => { action.style.background = "#323450"; });
+        action.addEventListener("mouseleave", () => { action.style.background = "#2c2e45"; });
+        action.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const mode = action.dataset.rankingMode;
+          closeToolkitMenu();
+          openRankingModal(mode);
+        });
+      }
       menu.addEventListener("click", (event) => event.stopPropagation());
       document.body.append(menu);
       rankingUi.menu = menu;
@@ -3912,7 +4072,7 @@
         </style>
         <div id="enhance-ranking-floating-dialog" role="dialog" aria-modal="true" aria-labelledby="enhance-ranking-floating-title">
           <div class="ehr-modal-head">
-            <strong id="enhance-ranking-floating-title">强化榜</strong>
+            <strong id="enhance-ranking-floating-title">填单榜</strong>
             <button class="ehr-modal-close" type="button" aria-label="关闭强化榜" title="关闭（Esc）">×</button>
           </div>
           <div class="ehr-modal-body"></div>
@@ -3930,13 +4090,24 @@
       rankingUi.panel = panel;
     }
 
-    function openRankingModal() {
+    function openRankingModal(mode = "bid") {
+      const config = getRankingModeConfig(mode);
+      const modeChanged = rankingUi.mode !== config.mode;
+      if (modeChanged) {
+        rankingUi.mode = config.mode;
+        rankingUi.rows = [];
+        rankingUi.lastCalculationMs = null;
+        rankingUi.calculating = false;
+        rankingUi.calculationToken += 1;
+      }
       createRankingModal();
+      applyRankingModePresentation(rankingUi.panel);
+      rankingUi.dialog.querySelector("#enhance-ranking-floating-title").textContent = config.modalTitle;
       rankingUi.overlay.hidden = false;
       renderRankingRows(rankingUi.panel);
       rankingUi.dialog.querySelector(".ehr-modal-close")?.focus({ preventScroll: true });
       window.requestAnimationFrame(() => {
-        window.setTimeout(() => calculateRanking(rankingUi.panel), 0);
+        window.setTimeout(() => calculateRanking(rankingUi.panel, modeChanged), 0);
       });
     }
 
@@ -3956,8 +4127,8 @@
       const button = document.createElement("button");
       button.id = "mwi-enhance-toolkit-button";
       button.type = "button";
-      button.textContent = "工具箱";
-      button.title = "强化工具箱";
+      button.textContent = "强化榜";
+      button.title = "强化榜";
       button.setAttribute("aria-haspopup", "menu");
       button.setAttribute("aria-controls", "mwi-enhance-toolkit-menu");
       button.setAttribute("aria-expanded", "false");
@@ -4485,7 +4656,7 @@
     // ═══════════════════════════════════════════════
 
     async function init() {
-      console.log("[MWI Enhance Helper] header toolbox ranking v1.12.2 loaded");
+      console.log("[MWI Enhance Helper] ranking boards v1.13.1 loaded");
       injectTooltipStyle();
       document.addEventListener("click", hideTooltip);
       window.addEventListener("scroll", hideTooltip, true);
