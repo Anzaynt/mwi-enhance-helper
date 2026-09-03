@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Milkyway Idle - Enhance Helper
 // @namespace    https://github.com/Anzaynt/mwi-enhance-helper
-// @version      1.12.0
-// @description  Header toolbox with multi-route enhancement ranking and a live stop/continue EV helper.
+// @version      1.12.2
+// @description  Header toolbox with market-linked multi-route enhancement ranking and a live stop/continue EV helper.
 // @author       Anzaynt
 // @license      MIT
 // @homepageURL   https://github.com/Anzaynt/mwi-enhance-helper
@@ -2135,6 +2135,7 @@
 
     let marketDataCache = null;
     let marketDataLoaded = false;
+    const marketOrderBookRevision = Object.create(null);
 
     async function fetchMarketApi() {
       try {
@@ -2197,11 +2198,11 @@
           const bids = book.bids || [];
           const askPrice = asks.length > 0 ? Math.min(...asks.map(l => l.price)) : -1;
           const bidPrice = bids.length > 0 ? Math.max(...bids.map(l => l.price)) : -1;
-          if (askPrice !== -1 || bidPrice !== -1) {
-            marketDataCache[itemHrid][level] = { a: askPrice, b: bidPrice };
-          }
+          // 空订单簿也要覆盖旧值，避免跳转市场后仍使用过时的买/卖价。
+          marketDataCache[itemHrid][level] = { a: askPrice, b: bidPrice };
         }
       }
+      marketOrderBookRevision[itemHrid] = (marketOrderBookRevision[itemHrid] || 0) + 1;
     }
 
     function getOrderBookListings(itemHrid, enhanceLevel, isAskSide) {
@@ -3366,6 +3367,7 @@
       calculating: false,
       calculationToken: 0,
       lastCalculationMs: null,
+      marketNavigationBusy: false,
       integrationTimer: null
     };
 
@@ -3376,6 +3378,132 @@
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
+    }
+
+    function isVisibleElement(element) {
+      if (!(element instanceof Element)) return false;
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = element; current && current !== document.documentElement; current = current.parentElement) {
+        const style = window.getComputedStyle(current);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+      }
+      return true;
+    }
+
+    function findMarketplaceNavigationHandler() {
+      const roots = [];
+      const gamePage = document.querySelector('[class^="GamePage"]');
+      const gameFiberKey = gamePage && Object.keys(gamePage).find((key) => key.startsWith("__reactFiber$"));
+      if (gameFiberKey && gamePage[gameFiberKey]) {
+        for (let fiber = gamePage[gameFiberKey]; fiber; fiber = fiber.return) roots.push(fiber);
+      }
+      const rootElement = document.getElementById("root");
+      if (rootElement?._reactRootContainer?.current) roots.push(rootElement._reactRootContainer.current);
+
+      const methodNames = ["handleGoToMarketplace", "goToMarketplace", "openMarketplace", "handleOpenMarketplace"];
+      const visited = new Set();
+      const queue = roots.filter(Boolean);
+      let steps = 0;
+      while (queue.length > 0 && steps++ < 20000) {
+        const fiber = queue.shift();
+        if (!fiber || typeof fiber !== "object" || visited.has(fiber)) continue;
+        visited.add(fiber);
+        const node = fiber.stateNode;
+        if (node) {
+          const methodName = methodNames.find((name) => typeof node[name] === "function");
+          if (methodName) return { node, methodName };
+        }
+        if (fiber.child) queue.push(fiber.child);
+        if (fiber.sibling) queue.push(fiber.sibling);
+      }
+      return null;
+    }
+
+    async function openMarketplaceWithGameHandler(itemHrid, enhancementLevel) {
+      const handler = findMarketplaceNavigationHandler();
+      if (!handler) return false;
+      const level = Math.max(0, Math.floor(Number(enhancementLevel) || 0));
+      const argumentVariants = [
+        [itemHrid, level],
+        [{ itemHrid, enhancementLevel: level }],
+        [itemHrid]
+      ];
+      for (const args of argumentVariants) {
+        try {
+          await Promise.resolve(handler.node[handler.methodName](...args));
+          return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+
+    function findVisibleItemElement(itemHrid) {
+      const itemKey = String(itemHrid || "").replace(/^\/items\//, "");
+      if (!itemKey) return null;
+      const candidates = document.querySelectorAll('[class*="Item_item"], [class*="Item_itemContainer"]');
+      for (const element of candidates) {
+        if (!isVisibleElement(element)) continue;
+        const use = element.querySelector("svg use");
+        const href = use?.href?.baseVal || use?.getAttribute?.("href") || use?.getAttribute?.("xlink:href") || "";
+        if (href.includes(`#${itemKey}`) || href.includes(`/items/${itemKey}`) || href.endsWith(itemKey)) return element;
+      }
+      return null;
+    }
+
+    async function openMarketplaceWithItemMenu(itemHrid) {
+      const item = findVisibleItemElement(itemHrid);
+      if (!item) return false;
+      item.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      let actionMenu = null;
+      for (let attempt = 0; attempt < 10 && !actionMenu; attempt++) {
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+        actionMenu = Array.from(document.querySelectorAll('[class*="Item_actionMenu"], [class*="Item_contextMenu"]'))
+          .find(isVisibleElement) || null;
+      }
+      if (!actionMenu) return false;
+      const marketButton = Array.from(actionMenu.querySelectorAll("button, [role=button]"))
+        .find((button) => /前往市场|市场|market/i.test(String(button.textContent || "")));
+      if (!marketButton) return false;
+      marketButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }
+
+    async function openMarketplaceForRankingItem(itemHrid, enhancementLevel) {
+      return await openMarketplaceWithGameHandler(itemHrid, enhancementLevel)
+        || await openMarketplaceWithItemMenu(itemHrid);
+    }
+
+    async function waitForMarketNavigationUpdate(itemHrid, previousRevision) {
+      const deadline = Date.now() + 3500;
+      while (Date.now() < deadline) {
+        if ((marketOrderBookRevision[itemHrid] || 0) > previousRevision) return true;
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+      }
+      return false;
+    }
+
+    async function navigateToRankingMarket(panel, itemHrid, targetLevel) {
+      if (rankingUi.marketNavigationBusy) return;
+      rankingUi.marketNavigationBusy = true;
+      const status = panel?.querySelector('[data-role="ranking-status"]');
+      if (status) status.textContent = `正在打开 ${itemHrid} +${targetLevel} 市场…`;
+      const revision = marketOrderBookRevision[itemHrid] || 0;
+      try {
+        const opened = await openMarketplaceForRankingItem(itemHrid, targetLevel);
+        if (!opened) {
+          if (status) status.textContent = "无法定位游戏市场入口；请先打开背包或市场后重试。";
+          return;
+        }
+        closeRankingModal();
+        const updated = await waitForMarketNavigationUpdate(itemHrid, revision);
+        if (status) status.textContent = updated
+          ? "已接收该商品的最新订单簿，正在更新对应强化榜条目…"
+          : "未在等待期内收到订单簿更新，正使用当前缓存更新对应条目…";
+        refreshRankingMarketRow(panel, itemHrid, targetLevel);
+      } finally {
+        rankingUi.marketNavigationBusy = false;
+      }
     }
 
     function createRankingPanel() {
@@ -3402,6 +3530,9 @@
           #enhance-hourly-ranking-panel td{padding:5px 6px;text-align:right;border-bottom:1px solid #2c2e42}
           #enhance-hourly-ranking-panel td:nth-child(1),#enhance-hourly-ranking-panel td:nth-child(2){text-align:left}
           #enhance-hourly-ranking-panel tbody tr:hover{background:#242638}
+          #enhance-hourly-ranking-panel .ehr-market-link{min-height:0;padding:0;border:0;background:transparent;color:#a9d8ff;font:inherit;text-align:left;cursor:pointer;text-decoration:underline;text-decoration-color:rgba(169,216,255,.45);text-underline-offset:2px}
+          #enhance-hourly-ranking-panel .ehr-market-link:hover{color:#fff;text-decoration-color:currentColor}
+          #enhance-hourly-ranking-panel .ehr-market-link:focus-visible{outline:1px solid #9ddaff;outline-offset:2px}
           #enhance-hourly-ranking-panel .ehr-positive{color:#7be0bc}
           #enhance-hourly-ranking-panel .ehr-negative{color:#ff7b82}
           #enhance-hourly-ranking-panel .ehr-muted{color:#888ca7}
@@ -3409,7 +3540,7 @@
         </style>
         <div class="ehr-wrap">
           <div class="ehr-title"><h3>强化收购价排行榜</h3><span>0 → 目标等级</span></div>
-          <p class="ehr-note">仅使用公开市场快照中的最高收购价（Bid），按税后 95% 收入计算。排行榜计算完全在本地完成。</p>
+          <p class="ehr-note">仅使用当前市场缓存中的最高收购价（Bid），按税后 95% 收入计算。点击物品可跳转对应 +N 市场，并只更新该条目的行情与结果。</p>
           <div class="ehr-controls">
             <input data-role="ranking-search" type="search" placeholder="筛选物品名称 / HRID">
             <select data-role="ranking-sort" title="排序指标">
@@ -3440,6 +3571,12 @@
       panel.querySelector('[data-role="ranking-limit"]').addEventListener("change", () => renderRankingRows(panel));
       panel.querySelector('[data-role="ranking-search"]').addEventListener("input", () => renderRankingRows(panel));
       panel.querySelector('[data-role="ranking-refresh"]').addEventListener("click", () => calculateRanking(panel, true));
+      panel.querySelector('[data-role="ranking-body"]').addEventListener("click", (event) => {
+        const link = event.target.closest('[data-role="ranking-market-link"]');
+        if (!link) return;
+        event.preventDefault();
+        navigateToRankingMarket(panel, link.dataset.itemHrid, Number(link.dataset.targetLevel));
+      });
       return panel;
     }
 
@@ -3479,7 +3616,7 @@
       body.innerHTML = rows.map((row, index) => `
         <tr title="${escapeRankingHtml(row.itemHrid)}">
           <td>${index + 1}</td>
-          <td>${escapeRankingHtml(row.itemName)}</td>
+          <td><button class="ehr-market-link" type="button" data-role="ranking-market-link" data-item-hrid="${escapeRankingHtml(row.itemHrid)}" data-target-level="${row.targetLevel}" title="前往 +${row.targetLevel} 市场并刷新本条结果">${escapeRankingHtml(row.itemName)}</button></td>
           <td>+${row.targetLevel}</td>
           <td>${formatMoney(row.bidPrice)}</td>
           <td class="${rankingValueClass(row.hourly)}">${formatMoney(row.hourly)}</td>
@@ -3525,6 +3662,52 @@
         }
       }
       return jobs;
+    }
+
+    function createRankingRow(job, metrics, totalAsset) {
+      const hourly = calcHourlyCost(metrics, job.bidPrice);
+      const riskHourly = metrics.routeType === "traditional"
+        ? calcRiskAdjustedHourlyCost(metrics, job.bidPrice, totalAsset)
+        : null;
+      if (!Number.isFinite(hourly) || !Number.isFinite(metrics.expPerHour)) return null;
+      return {
+        itemHrid: job.itemHrid,
+        itemName: PRIVATE_ZH_ITEM_HRIDS[job.itemHrid]
+          || PRIVATE_ZH_ITEM_NAMES[job.item?.name]
+          || job.item?.name
+          || job.itemHrid.split("/").pop().replaceAll("_", " "),
+        targetLevel: job.targetLevel,
+        bidPrice: job.bidPrice,
+        hourly,
+        riskHourly: Number.isFinite(riskHourly) ? riskHourly : null,
+        expPerHour: metrics.expPerHour,
+        protectLevel: metrics.protectLevel,
+        routeLabel: metrics.routeLabel,
+        totalCost: metrics.totalCostNoHourly,
+        totalTimeHours: metrics.totalTimeHours
+      };
+    }
+
+    function refreshRankingMarketRow(panel, itemHrid, targetLevel) {
+      const rowIndex = rankingUi.rows.findIndex((row) =>
+        row.itemHrid === itemHrid && row.targetLevel === targetLevel
+      );
+      if (rowIndex < 0) return;
+
+      const state = getGameState();
+      const buffs = state ? computeEnhancingBuffs(state) : null;
+      const item = state ? getItemDetail(itemHrid, state) : null;
+      const bidPrice = getMarketBidPrice(itemHrid, targetLevel);
+      let replacement = null;
+      if (buffs && item && bidPrice > 0) {
+        const job = { itemHrid, targetLevel, bidPrice, item };
+        const planner = createEnhancementRoutePlanner(buffs, state);
+        const metrics = computeBestMetrics(itemHrid, targetLevel, buffs, state, bidPrice, planner);
+        if (metrics) replacement = createRankingRow(job, metrics, getCurrentAssetsFromMWITools());
+      }
+      if (replacement) rankingUi.rows.splice(rowIndex, 1, replacement);
+      else rankingUi.rows.splice(rowIndex, 1);
+      if (panel?.isConnected) renderRankingRows(panel);
     }
 
     function yieldRankingCalculation() {
@@ -3577,28 +3760,8 @@
           const job = jobs[index];
           const metrics = computeBestMetrics(job.itemHrid, job.targetLevel, buffs, state, job.bidPrice, routePlanner);
           if (metrics) {
-            const hourly = calcHourlyCost(metrics, job.bidPrice);
-            const riskHourly = metrics.routeType === "traditional"
-              ? calcRiskAdjustedHourlyCost(metrics, job.bidPrice, totalAsset)
-              : null;
-            if (Number.isFinite(hourly) && Number.isFinite(metrics.expPerHour)) {
-              rankingUi.rows.push({
-                itemHrid: job.itemHrid,
-                itemName: PRIVATE_ZH_ITEM_HRIDS[job.itemHrid]
-                  || PRIVATE_ZH_ITEM_NAMES[job.item?.name]
-                  || job.item?.name
-                  || job.itemHrid.split("/").pop().replaceAll("_", " "),
-                targetLevel: job.targetLevel,
-                bidPrice: job.bidPrice,
-                hourly,
-                riskHourly: Number.isFinite(riskHourly) ? riskHourly : null,
-                expPerHour: metrics.expPerHour,
-                protectLevel: metrics.protectLevel,
-                routeLabel: metrics.routeLabel,
-                totalCost: metrics.totalCostNoHourly,
-                totalTimeHours: metrics.totalTimeHours
-              });
-            }
+            const row = createRankingRow(job, metrics, totalAsset);
+            if (row) rankingUi.rows.push(row);
           }
 
           const now = performance.now();
@@ -4322,7 +4485,7 @@
     // ═══════════════════════════════════════════════
 
     async function init() {
-      console.log("[MWI Enhance Helper] header toolbox ranking v1.11.0 loaded");
+      console.log("[MWI Enhance Helper] header toolbox ranking v1.12.2 loaded");
       injectTooltipStyle();
       document.addEventListener("click", hideTooltip);
       window.addEventListener("scroll", hideTooltip, true);
